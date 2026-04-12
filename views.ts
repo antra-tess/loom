@@ -7,6 +7,7 @@ import {
   Setting,
   WorkspaceLeaf,
   setIcon,
+  Notice,
 } from "obsidian";
 import { Range } from "@codemirror/state";
 import {
@@ -19,6 +20,120 @@ import {
 } from "@codemirror/view";
 const dialog = require("electron").remote.dialog;
 
+// Define quick tags once to use everywhere
+const QUICK_TAGS = [
+  { tag: 'to_continue', label: 'To Continue', icon: 'git-branch-plus', emoji: '\u{1F333}' },
+  { tag: 'fav', label: 'Favorite', icon: 'star', emoji: '\u{2B50}' },
+  { tag: 'private', label: 'Private', icon: 'lock', emoji: '\u{1F512}' }
+];
+
+// Parse filter string like "+to_continue -private fav"
+function parseFilter(filterStr: string): { include: string[], exclude: string[] } {
+  const include: string[] = [];
+  const exclude: string[] = [];
+
+  if (!filterStr.trim()) return { include, exclude };
+
+  const parts = filterStr.trim().split(/\s+/);
+  for (const part of parts) {
+    if (part.startsWith('+')) {
+      include.push(part.slice(1));
+    } else if (part.startsWith('-')) {
+      exclude.push(part.slice(1));
+    } else if (part.trim()) {
+      // No prefix means include
+      include.push(part);
+    }
+  }
+
+  return { include, exclude };
+}
+
+// Check if a node matches the filter criteria
+function nodeMatchesFilter(node: Node, include: string[], exclude: string[]): boolean {
+  const nodeTags = node.tags || [];
+
+  // Must have all included tags
+  for (const tag of include) {
+    if (!nodeTags.includes(tag)) return false;
+  }
+
+  // Must not have any excluded tags
+  for (const tag of exclude) {
+    if (nodeTags.includes(tag)) return false;
+  }
+
+  return true;
+}
+
+// Debug logging helper
+function debugLog(settings: any, ...args: any[]) {
+  if (settings?.developerMode) {
+    console.log('[Loom Filter Debug]', ...args);
+  }
+}
+
+// Build a set of nodes to show based on filter rules
+function buildFilteredNodeSet(state: NoteState, include: string[], exclude: string[], settings?: any): Set<string> {
+  debugLog(settings, 'Building filtered node set:', { include, exclude });
+
+  if (include.length === 0 && exclude.length === 0) {
+    // No filters - show everything
+    const allNodes = new Set(Object.keys(state.nodes));
+    debugLog(settings, 'No filters active, showing all', allNodes.size, 'nodes');
+    return allNodes;
+  }
+
+  const directMatches = new Set<string>();
+  const toHide = new Set<string>();
+
+  // First pass: find nodes that directly match the filter
+  for (const [id, node] of Object.entries(state.nodes)) {
+    if (nodeMatchesFilter(node, include, exclude)) {
+      directMatches.add(id);
+    }
+  }
+
+  debugLog(settings, 'Direct matches found:', directMatches.size, 'nodes');
+
+  // Second pass: for excluded tags, hide those nodes and all descendants
+  for (const [id, node] of Object.entries(state.nodes)) {
+    const nodeTags = node.tags || [];
+    if (exclude.some(tag => nodeTags.includes(tag))) {
+      // Hide this node and all its descendants
+      const hideDescendants = (nodeId: string) => {
+        toHide.add(nodeId);
+        for (const [childId, childNode] of Object.entries(state.nodes)) {
+          if (childNode.parentId === nodeId) {
+            hideDescendants(childId);
+          }
+        }
+      };
+      hideDescendants(id);
+    }
+  }
+
+  debugLog(settings, 'Excluded nodes and descendants:', toHide.size, 'nodes');
+
+  // Third pass: include ancestors of direct matches to ensure tree connectivity
+  const toShow = new Set<string>();
+  for (const matchId of directMatches) {
+    if (!toHide.has(matchId)) {
+      // Add this node and all its ancestors
+      let currentId: string | null = matchId;
+      while (currentId) {
+        if (!toHide.has(currentId)) {
+          toShow.add(currentId);
+        }
+        currentId = state.nodes[currentId]?.parentId || null;
+      }
+    }
+  }
+
+  debugLog(settings, 'Final filtered set:', toShow.size, 'nodes visible');
+  return toShow;
+}
+
 interface NodeContext {
   app: App;
   state: NoteState;
@@ -26,6 +141,15 @@ interface NodeContext {
   node: Node;
   deletable: boolean;
 }
+
+// Helper to copy a loom node link to clipboard
+const copyNodeLink = (app: App, id: string) => {
+  const file = app.workspace.getActiveFile();
+  if (!file) return;
+  const link = `[[${file.path}#loom=${id}]]`;
+  navigator.clipboard.writeText(link);
+  new Notice("Loom link copied to clipboard");
+};
 
 const showNodeMenu = (
   event: MouseEvent,
@@ -51,13 +175,18 @@ const showNodeMenu = (
     zeroArgMenuItem("Unhoist", "arrow-down", "loom:unhoist");
   else selfArgMenuItem("Hoist", "arrow-up", "loom:hoist");
 
-  if (node.bookmarked)
-    selfArgMenuItem(
-      "Remove bookmark",
-      "bookmark-minus",
-      "loom:toggle-bookmark"
+  menu.addSeparator();
+  QUICK_TAGS.forEach(({ tag, label, icon }) => {
+    const hasTag = (node.tags || []).includes(tag);
+    menuItem(
+      hasTag ? `Remove ${label}` : `Add ${label}`,
+      icon,
+      () => app.workspace.trigger("loom:toggle-tag", { id, tag })
     );
-  else selfArgMenuItem("Bookmark", "bookmark", "loom:toggle-bookmark");
+  });
+
+  // copy link item
+  menuItem("Copy link", "link", () => copyNodeLink(app, id));
 
   menu.addSeparator();
   selfArgMenuItem("Create child", "plus", "loom:create-child");
@@ -65,7 +194,7 @@ const showNodeMenu = (
 
   menu.addSeparator();
   selfArgMenuItem("Delete all children", "x", "loom:clear-children");
-  selfArgMenuItem("Delete all siblings", "list-x", "loom:clear-siblings");
+  selfArgMenuItem("Delete all siblings", "x-square", "loom:clear-siblings");
 
   if (node.parentId !== null) {
     menu.addSeparator();
@@ -115,14 +244,18 @@ const renderNodeButtons = (
   else
     button("Hoist", "arrow-up", () => app.workspace.trigger("loom:hoist", id));
 
-  if (node.bookmarked)
-    button("Remove bookmark", "bookmark-minus", () =>
-      app.workspace.trigger("loom:toggle-bookmark", id)
+  // Quick tag buttons
+  QUICK_TAGS.forEach(({ tag, label, icon }) => {
+    const hasTag = (node.tags || []).includes(tag);
+    button(
+      hasTag ? `Remove ${label}` : `Add ${label}`,
+      icon,
+      () => app.workspace.trigger("loom:toggle-tag", { id, tag })
     );
-  else
-    button("Bookmark", "bookmark", () =>
-      app.workspace.trigger("loom:toggle-bookmark", id)
-    );
+  });
+
+  // copy link button
+  button("Copy link", "link", () => copyNodeLink(app, id));
 
   if (deletable)
     button("Delete", "trash", () => app.workspace.trigger("loom:delete", [id]));
@@ -162,13 +295,14 @@ export class LoomView extends ItemView {
     const container = this.containerEl.createDiv({ cls: "outline" });
     if (settings.showExport) this.renderAltExportInterface(container);
     if (settings.showSearchBar) this.renderSearchBar(container, state);
-    if (settings.showSettings) this.renderSettings(container, settings);
+    if (settings.showSettings) this.renderSettings(container, settings, state);
 
-    if (!state) {
+    if (state === null) {
       container.createDiv({ cls: "pane-empty", text: "No note selected." });
       return;
     }
-    this.renderBookmarks(container, state);
+
+    this.renderTaggedNodes(container, state);
     this.tree = container.createDiv();
     this.renderTree(this.tree, state);
 
@@ -177,7 +311,6 @@ export class LoomView extends ItemView {
     // scroll to active node in the tree
     const activeNode = this.tree.querySelector(".is-active");
     if (activeNode) {
-      //&& !container.contains(activeNode)){
       activeNode.scrollIntoView({ block: "nearest" });
     }
   }
@@ -279,7 +412,7 @@ export class LoomView extends ItemView {
       cls: "loom__alt-export-field",
     });
     const exportInput = exportContainer.createEl("input", {
-      attr: { type: "text", placeholder: "Path to export to" },
+      attr: { type: "text", placeholder: "Path to export to (use .html for HTML export)" },
     });
     const exportButton = exportContainer.createEl("button", {});
     setIcon(exportButton, "download");
@@ -287,6 +420,22 @@ export class LoomView extends ItemView {
     exportButton.addEventListener("click", () => {
       if (exportInput.value)
         this.app.workspace.trigger("loom:export", exportInput.value);
+    });
+
+    // Add HTML export button
+    const htmlExportButton = exportContainer.createEl("button", {
+      cls: "loom__html-export-button",
+      attr: { "aria-label": "Export as HTML" },
+    });
+    setIcon(htmlExportButton, "globe");
+
+    htmlExportButton.addEventListener("click", () => {
+      if (exportInput.value) {
+        const path = exportInput.value.endsWith('.html')
+          ? exportInput.value
+          : exportInput.value + '.html';
+        this.app.workspace.trigger("loom:export-html", path);
+      }
     });
   }
 
@@ -312,7 +461,7 @@ export class LoomView extends ItemView {
     });
   }
 
-  renderSettings(container: HTMLElement, settings: LoomSettings) {
+  renderSettings(container: HTMLElement, settings: LoomSettings, state: NoteState | null) {
     const settingsContainer = container.createDiv({ cls: "loom__settings" });
 
     // visibility checkboxes
@@ -384,7 +533,7 @@ export class LoomView extends ItemView {
         presetDropdown
           .createEl("option")
           .createEl("i", {
-            text: "[You have no presets. Go to Settings → Loom.]",
+            text: "[You have no presets. Go to Settings -> Loom.]",
           });
       else {
         for (const i in settings.modelPresets) {
@@ -477,33 +626,56 @@ export class LoomView extends ItemView {
     setting("Prepend sequence", "prepend", settings.prepend, "string");
     setting("System prompt", "systemPrompt", settings.systemPrompt, "string");
     setting("User message", "userMessage", settings.userMessage, "string");
+
+    // Tag filter
+    const filterContainer = settingsContainer.createDiv({
+      cls: "loom__setting",
+    });
+    filterContainer.createEl("label", { text: "Tag filter" });
+    const filterInput = filterContainer.createEl("input", {
+      type: "text",
+      value: state?.filter || "",
+      placeholder: "+to_continue -private fav"
+    });
+    filterInput.addEventListener("input", () => {
+      this.app.workspace.trigger("loom:set-filter", filterInput.value);
+    });
   }
 
-  renderBookmarks(container: HTMLElement, state: NoteState) {
-    const bookmarks = Object.entries(state.nodes).filter(
-      ([, node]) => node.bookmarked
+  renderTaggedNodes(container: HTMLElement, state: NoteState) {
+    const favorites = Object.entries(state.nodes).filter(
+      ([, node]) => (node.tags || []).includes('fav')
     );
 
-    const bookmarksContainer = container.createDiv({ cls: "loom__bookmarks" });
+    const favoritesContainer = container.createDiv({ cls: "loom__favorites" });
 
-    const bookmarksHeader = bookmarksContainer.createDiv({
-      cls: "tree-item-self loom__tree-header",
+    const favoritesHeader = favoritesContainer.createDiv({
+      cls: "tree-item-self is-clickable loom__tree-header",
     });
-    bookmarksHeader.createSpan({
+    favoritesHeader.createSpan({
       cls: "tree-item-inner loom__tree-header-text",
-      text: "Bookmarks",
+      text: "Favorites",
     });
-    bookmarksHeader.createSpan({
-      cls: "tree-item-flair-outer loom__bookmarks-count",
-      text: String(bookmarks.length),
+    favoritesHeader.createSpan({
+      cls: "tree-item-flair-outer loom__favorites-count",
+      text: String(favorites.length),
     });
 
-    for (const [id] of bookmarks)
-      this.renderNode(bookmarksContainer, state, id, false);
+    for (const [id] of favorites)
+      this.renderNode(favoritesContainer, state, id, false, null);
   }
 
   renderTree(container: HTMLElement, state: NoteState) {
     container.empty();
+
+    // Build filtered node set if filter is active
+    let filteredNodes: Set<string> | null = null;
+    if (state.filter) {
+      const { include, exclude } = parseFilter(state.filter);
+      if (include.length > 0 || exclude.length > 0) {
+        filteredNodes = buildFilteredNodeSet(state, include, exclude, this.getSettings());
+      }
+    }
 
     const treeHeader = container.createDiv({
       cls: "tree-item-self loom__tree-header",
@@ -513,6 +685,15 @@ export class LoomView extends ItemView {
       if (state.hoisted.length > 0)
         headerText = "Search results under hoisted node";
       else headerText = "Search results";
+    } else if (state.filter) {
+      const { include, exclude } = parseFilter(state.filter);
+      if (include.length > 0 || exclude.length > 0) {
+        headerText = `Filtered nodes (${state.filter})`;
+      } else if (state.hoisted.length > 0) {
+        headerText = "Hoisted node";
+      } else {
+        headerText = "All nodes";
+      }
     } else if (state.hoisted.length > 0) headerText = "Hoisted node";
     else headerText = "All nodes";
     treeHeader.createSpan({
@@ -525,14 +706,15 @@ export class LoomView extends ItemView {
         container,
         state,
         state.hoisted[state.hoisted.length - 1],
-        true
+        true,
+        filteredNodes
       );
     else {
       const rootIds = Object.entries(state.nodes)
         .filter(([, node]) => node.parentId === null)
         .map(([id]) => id);
       for (const rootId of rootIds)
-        this.renderNode(container, state, rootId, true);
+        this.renderNode(container, state, rootId, true, filteredNodes);
     }
   }
 
@@ -540,11 +722,17 @@ export class LoomView extends ItemView {
     container: HTMLElement,
     state: NoteState,
     id: string,
-    inTree: boolean
+    inTree: boolean,
+    filteredNodes: Set<string> | null = null
   ) {
     const node = state.nodes[id];
 
     if (inTree && node.searchResultState === "none") return;
+
+    // Apply tag filter
+    if (inTree && filteredNodes && !filteredNodes.has(id)) {
+      return;
+    }
 
     const branchContainer = container.createDiv({});
 
@@ -575,14 +763,23 @@ export class LoomView extends ItemView {
       );
     }
 
-    // if the node is bookmarked, add a bookmark icon
+    // Add quick tag icons (only for active tags)
+    const activeTags = QUICK_TAGS.filter(({ tag }) =>
+      (node.tags || []).includes(tag)
+    );
 
-    if (node.bookmarked) {
-      const bookmarkIcon = nodeContainer.createDiv({
-        cls: "loom__node-bookmark-icon",
+    activeTags.forEach(({ tag, emoji }) => {
+      const tagIcon = nodeContainer.createDiv({
+        cls: 'loom__node-tag-icon',
+        attr: { 'aria-label': tag },
+        text: emoji
       });
-      setIcon(bookmarkIcon, "bookmark");
-    }
+
+      tagIcon.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.app.workspace.trigger('loom:toggle-tag', { id, tag });
+      });
+    });
 
     // if the node is unread, add an unread indicator
 
@@ -668,7 +865,7 @@ export class LoomView extends ItemView {
       cls: "loom__node-children",
     });
     for (const childId of children)
-      this.renderNode(childrenContainer, state, childId, true);
+      this.renderNode(childrenContainer, state, childId, true, filteredNodes);
   }
 
   getViewType(): string {
@@ -724,7 +921,7 @@ export class LoomSiblingsView extends ItemView {
       });
       if (parentId !== null)
         nodeContainer.createSpan({
-          text: "…",
+          text: "...",
           cls: "loom__sibling-ellipsis",
         });
       nodeContainer.createSpan({ text: node.text.trim() });

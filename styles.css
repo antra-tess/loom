@@ -412,3 +412,35 @@ body {
 .hidden {
   display: none;
 }
+
+/* Tag icons */
+.loom__node-tag-icon {
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  margin-left: -0.025em;
+  padding: 0.1em 0.075em;
+  border-radius: 0.25em;
+  font-size: 0.9em;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+}
+.loom__node-tag-icon:hover {
+  background-color: var(--nav-item-background-active);
+}
+
+/* HTML Export Button */
+.loom__html-export-button {
+  background-color: var(--color-accent);
+  border: none;
+  border-radius: 3px;
+  padding: 0.4em;
+  cursor: pointer;
+  color: var(--text-on-accent);
+  margin-left: 0.3em;
+}
+
+.loom__html-export-button:hover {
+  background-color: var(--color-accent-hover);
+}

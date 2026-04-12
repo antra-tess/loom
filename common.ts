@@ -8,6 +8,7 @@ export const PROVIDERS = [
   "azure-chat",
   "anthropic",
   "openrouter",
+  "bedrock",
 ];
 export type Provider = (typeof PROVIDERS)[number];
 
@@ -19,6 +20,7 @@ type ProviderProps = {
   "azure-chat": { url: string };
   anthropic: { url: string };
   openrouter: { quantization: string };
+  bedrock: { region: string };
 };
 
 type SharedPresetSettings = {
@@ -58,6 +60,14 @@ export interface LoomSettings {
   showSearchBar: boolean;
   showNodeBorders: boolean;
   showExport: boolean;
+
+  /** When true, emit verbose console logs for debugging and development */
+  developerMode: boolean;
+
+  // Storage settings
+  useDocumentStorage: boolean;
+  documentStorageLocation: 'alongside' | 'plugin-folder';
+  autoMigrateOnSwitch: boolean;
 }
 
 export const getPreset = (settings: LoomSettings) =>
@@ -70,15 +80,38 @@ export interface Node {
   parentId: string | null;
   collapsed: boolean;
   unread: boolean;
-  bookmarked: boolean;
+  tags: string[];
   lastVisited?: number;
+  created?: number;
+  childrenGeneratedAt?: number;
+  siblingExplorationRatio?: number;
+  generationSpeed?: number;
+  intensity?: number;
   searchResultState: SearchResultState;
+
+  // Extended metadata fields
+  nodeType?: 'ai-generated' | 'user-edited' | 'user-created';
+  createdTimestamp?: number;
+  firstReadTimestamp?: number;
+  reReadTimestamps?: number[];
+  generationModel?: string;
+  generationParameters?: {
+    temperature?: number;
+    maxTokens?: number;
+    topP?: number;
+    frequencyPenalty?: number;
+    presencePenalty?: number;
+    provider?: string;
+    model?: string;
+  };
+  originalNodeId?: string; // For edited nodes, reference to original
 }
 
 export interface NoteState {
   current: string;
   hoisted: string[];
   searchTerm: string;
+  filter: string;
   nodes: Record<string, Node>;
   generating: string | null;
 }
