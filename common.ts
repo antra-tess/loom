@@ -9,6 +9,7 @@ export const PROVIDERS = [
   "anthropic",
   "openrouter",
   "bedrock",
+  "probe",
 ];
 export type Provider = (typeof PROVIDERS)[number];
 
@@ -21,7 +22,23 @@ type ProviderProps = {
   anthropic: { url: string };
   openrouter: { quantization: string };
   bedrock: { region: string };
+  probe: { url: string };
 };
+
+export type SteeringType = "none" | "steer" | "floor" | "ceil";
+
+export interface ProbeSetInfo {
+  name: string;
+  layer: number;
+  labels: string[];
+}
+
+export interface ProbeConfig {
+  model: string;
+  model_type: string;
+  probes: ProbeSetInfo[];
+  intervention_types: string[];
+}
 
 type SharedPresetSettings = {
   name: string;
@@ -68,6 +85,14 @@ export interface LoomSettings {
   useDocumentStorage: boolean;
   documentStorageLocation: 'alongside' | 'plugin-folder';
   autoMigrateOnSwitch: boolean;
+
+  // Probe-server steering
+  steeringType: SteeringType;
+  steeringProbe: string;
+  steeringProbeIndex: number;
+  steeringStrength: number;
+  steeringRenorm: boolean;
+  probeConfigs: Record<string, ProbeConfig>;
 }
 
 export const getPreset = (settings: LoomSettings) =>
@@ -88,8 +113,8 @@ export interface Node {
   generationSpeed?: number;
   intensity?: number;
   searchResultState: SearchResultState;
-
-  // Extended metadata fields
+  
+  // New metadata fields for consciousness research
   nodeType?: 'ai-generated' | 'user-edited' | 'user-created';
   createdTimestamp?: number;
   firstReadTimestamp?: number;

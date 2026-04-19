@@ -3,6 +3,9 @@ import {
   LoomSiblingsView,
   LoomEditorPlugin,
   loomEditorPluginSpec,
+  probeReadoutExtension,
+  setProbeReadoutEffect,
+  ProbeReadout,
   MakePromptFromPassagesModal,
 } from "./views";
 import {
@@ -12,6 +15,8 @@ import {
   SearchResultState,
   Node,
   NoteState,
+  ProbeConfig,
+  SteeringType,
   getPreset,
 } from "./common";
 import { LoomStorage } from "./storage";
@@ -75,6 +80,7 @@ const DEFAULT_SETTINGS: LoomSettings = {
     prepend: false,
     systemPrompt: false,
     userMessage: false,
+    steering: true,
   },
   maxTokens: 60,
   temperature: 1,
@@ -92,11 +98,19 @@ const DEFAULT_SETTINGS: LoomSettings = {
   showNodeBorders: false,
   showExport: false,
   developerMode: false,
-
+  
   // Storage settings
   useDocumentStorage: false,
   documentStorageLocation: 'alongside',
   autoMigrateOnSwitch: false,
+
+  // Probe-server steering
+  steeringType: "none",
+  steeringProbe: "",
+  steeringProbeIndex: 0,
+  steeringStrength: 0,
+  steeringRenorm: false,
+  probeConfigs: {},
 };
 
 type CompletionResult =
@@ -148,7 +162,7 @@ class HTMLExportModal extends Modal {
     contentEl.createEl('p', {
       text: 'This will create a self-contained HTML file that can be shared with anyone.'
     });
-
+    
     const pathInfo = contentEl.createEl('div', { cls: 'setting-item-description' });
     pathInfo.innerHTML = `
       <p><strong>Path options:</strong></p>
@@ -162,7 +176,7 @@ class HTMLExportModal extends Modal {
     const inputContainer = contentEl.createDiv({ cls: 'setting-item' });
     inputContainer.createDiv({ cls: 'setting-item-name', text: 'Export path:' });
     const inputControl = inputContainer.createDiv({ cls: 'setting-item-control' });
-
+    
     const pathInput = inputControl.createEl('input', {
       type: 'text',
       value: this.defaultPath,
@@ -190,7 +204,7 @@ class HTMLExportModal extends Modal {
     if (this.defaultPath.endsWith('.html')) {
       pathInput.setSelectionRange(0, this.defaultPath.length - 5);
     }
-
+    
     // Allow Enter key to export
     pathInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
@@ -212,6 +226,8 @@ export default class LoomPlugin extends Plugin {
   azure: AzureOpenAIApi;
   anthropic: Anthropic;
   anthropicApiKey: string;
+
+  probeReadouts: Record<string, ProbeReadout> = {};
 
   rendering = false;
 
@@ -267,10 +283,15 @@ export default class LoomPlugin extends Plugin {
         })
       );
     } else if (preset.provider == "anthropic") {
+      //(property) ClientOptions.fetch?: Fetch | undefined
+      //Specify a custom fetch function implementation.
+      //If not provided, we use node-fetch on Node.js and otherwise expect that fetch is defined globally.
+      // expects Promise<Response> as return value
       this.anthropicApiKey = preset.apiKey;
 
       this.anthropic = new Anthropic({
         apiKey: preset.apiKey,
+        // fetch:
         defaultHeaders: {
           "anthropic-version": "2023-06-01",
           "anthropic-beta": "messages-2023-12-15",
@@ -303,7 +324,7 @@ export default class LoomPlugin extends Plugin {
       unread,
       tags: [],
       searchResultState: null,
-
+      
       // New metadata fields
       nodeType,
       createdTimestamp: now,
@@ -750,32 +771,33 @@ export default class LoomPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "export-html",
+      id: "export-html", 
       name: "Export as HTML",
       callback: () => {
         console.log("HTML export command triggered!");
-
+        
         const file = this.app.workspace.getActiveFile();
         if (!file) {
           new Notice("No active file to export");
           return;
         }
-
+        
         if (!this.state[file.path] || !this.state[file.path].nodes) {
           new Notice("No loom data found for this file. Try generating some completions first.");
           return;
         }
-
+        
         console.log("Exporting loom for:", file.path);
         const defaultPath = file.basename + ".html";
-
+        
+        // Create a proper modal instead of using prompt()
         new HTMLExportModal(this.app, defaultPath, (inputPath) => {
           console.log("Export path selected:", inputPath);
           try {
             this.app.workspace.trigger("loom:export-html", inputPath);
           } catch (error) {
             console.error("Export error:", error);
-            new Notice(`Export failed: ${(error as Error).message}`);
+            new Notice(`Export failed: ${error.message}`);
           }
         }).open();
       },
@@ -797,11 +819,11 @@ export default class LoomPlugin extends Plugin {
       LoomEditorPlugin,
       loomEditorPluginSpec
     );
-    this.registerEditorExtension([loomEditorPlugin]);
+    this.registerEditorExtension([loomEditorPlugin, probeReadoutExtension]);
 
     this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
       const target = evt.target as HTMLElement;
-
+      
       // Find the nearest anchor element
       const link = target.closest('a');
       if (!link) {
@@ -811,9 +833,11 @@ export default class LoomPlugin extends Plugin {
       // Determine the target text that might contain our loom hash
       let targetText: string | null = link.getAttribute('href');
       if (!targetText || targetText === '#' || targetText === '') {
+        // Some editors store the real link in a data-href attribute
         targetText = link.getAttribute('data-href');
       }
       if (!targetText || targetText === '#' || targetText === '') {
+        // Live Preview often sets href="#" and keeps the display text as the actual link
         targetText = link.textContent || '';
       }
 
@@ -824,22 +848,22 @@ export default class LoomPlugin extends Plugin {
 
       if (targetText.includes('#loom=')) {
         console.log(`Loom: Found loom link: ${targetText}`);
-        evt.preventDefault();
-        evt.stopPropagation();
+        evt.preventDefault(); // Stop Obsidian from handling the click
+        evt.stopPropagation(); // Stop the event from bubbling further
 
         const [path, hash] = targetText.split('#');
         if (hash && hash.startsWith('loom=')) {
-          const nodeId = hash.substring(5);
-
+          const nodeId = hash.substring(5); // 'loom='.length is 5
+          
           this.app.workspace.openLinkText(path, '', false).then(() => {
             setTimeout(() => {
               console.log(`Loom: Triggering loom:switch-to with ID: ${nodeId}`);
               this.app.workspace.trigger("loom:switch-to", nodeId);
-            }, 100);
+            }, 100); 
           });
         }
       }
-    }, { capture: true });
+    }, { capture: true }); // Use capture phase to intercept the click early.
 
     this.registerEvent(
       this.app.workspace.on(
@@ -959,13 +983,38 @@ export default class LoomPlugin extends Plugin {
           );
 
           // update the editor's text
+          // const cursor = this.editor.getCursor();
+          // const linesBefore = this.editor.getValue().split("\n");
           this.editor.setValue(this.fullText(file, id));
 
           // always move cursor to the end of the editor
           const line = this.editor.lineCount() - 1;
           const ch = this.editor.getLine(line).length;
           this.editor.setCursor({ line, ch });
+          // return;
 
+          // // if the cursor is at the beginning of the editor, move it to the end
+          // if(cursor.line === 0 && cursor.ch === 0) {
+          //   const line = this.editor.lineCount() - 1;
+          //   const ch = this.editor.getLine(line).length;
+          //   this.editor.setCursor({ line, ch });
+          //   return;
+          // }
+
+          // // if the text preceding the cursor has changed, move the cursor to the end of the text
+          // // otherwise, restore the cursor position
+          //     const linesAfter = this.editor
+          //       .getValue()
+          //       .split("\n")
+          //       .slice(0, cursor.line + 1);
+          //     for (let i = 0; i < cursor.line; i++)
+          //       if (linesBefore[i] !== linesAfter[i]) {
+          //         const line = this.editor.lineCount() - 1;
+          //         const ch = this.editor.getLine(line).length;
+          //         this.editor.setCursor({ line, ch });
+          //               return;
+          //       }
+          // this.editor.setCursor(cursor);
           this.saveAndRender(); // Add explicit view refresh
         })
       )
@@ -1234,6 +1283,22 @@ export default class LoomPlugin extends Plugin {
     );
 
     this.registerEvent(
+      this.app.workspace.on(
+        // @ts-expect-error
+        "loom:probe-doc",
+        () => this.withFile((file) => this.probeDocument(file))
+      )
+    );
+
+    this.registerEvent(
+      this.app.workspace.on(
+        // @ts-expect-error
+        "loom:probe-clear",
+        () => this.withFile((file) => this.clearProbeReadout(file))
+      )
+    );
+
+    this.registerEvent(
       // @ts-expect-error
       this.app.workspace.on("loom:search", (term: string) =>
         this.withFile((file) => {
@@ -1296,7 +1361,7 @@ export default class LoomPlugin extends Plugin {
       this.app.workspace.on("loom:export", (path: string) =>
         this.wftsar(async (file) => {
           const fullPath = untildify(path);
-
+          
           try {
             // Determine export format based on file extension
             if (fullPath.endsWith('.html')) {
@@ -1310,7 +1375,7 @@ export default class LoomPlugin extends Plugin {
             new Notice("Exported to " + fullPath);
           } catch (error) {
             console.error('Export failed:', error);
-            new Notice(`Export failed: ${(error as Error).message}`);
+            new Notice(`Export failed: ${error.message}`);
           }
         })
       )
@@ -1326,7 +1391,7 @@ export default class LoomPlugin extends Plugin {
             new Notice("HTML exported to " + fullPath);
           } catch (error) {
             console.error('HTML export failed:', error);
-            new Notice(`Export failed: ${(error as Error).message}`);
+            new Notice(`Export failed: ${error.message}`);
           }
         })
       )
@@ -1425,6 +1490,9 @@ export default class LoomPlugin extends Plugin {
       };
       plugin.update();
 
+      // Reapply any cached probe readout for this file
+      this.applyProbeReadout(this.probeReadouts[file.path] || null);
+
       this.refreshViews();
     };
 
@@ -1451,10 +1519,10 @@ export default class LoomPlugin extends Plugin {
         // Update in-memory state
         this.state[file.path] = this.state[oldPath];
         delete this.state[oldPath];
-
+        
         // Handle storage-specific rename
         this.storage.handleRename(oldPath, file.path);
-
+        
         // Only save if using legacy storage (document storage handles its own saves)
         if (!this.settings.useDocumentStorage) {
           this.save();
@@ -1468,10 +1536,10 @@ export default class LoomPlugin extends Plugin {
         if (file instanceof TFile) {
           this.storage.deleteNoteState(file);
         }
-
+        
         // Update in-memory state
         delete this.state[file.path];
-
+        
         // Only save if using legacy storage
         if (!this.settings.useDocumentStorage) {
           this.save();
@@ -1554,6 +1622,11 @@ export default class LoomPlugin extends Plugin {
     // and "\[" with "["
     prompt = prompt.replace(/\\</g, "<").replace(/\\\[/g, "[");
 
+    // the tokenization and completion depend on the provider,
+    // so call a different method depending on the provider
+
+    // console.log("prompt", prompt);
+
     const completionMethods: Record<
       Provider,
       (prompt: string) => Promise<CompletionResult>
@@ -1568,6 +1641,7 @@ export default class LoomPlugin extends Plugin {
       anthropic: this.completeAnthropic,
       openrouter: this.completeOpenRouter,
       bedrock: this.completeBedrock,
+      probe: this.completeProbe,
     };
     let result;
     try {
@@ -1591,6 +1665,8 @@ export default class LoomPlugin extends Plugin {
       return;
     }
     const rawCompletions = result.completions;
+
+    // console.log("rawCompletions", rawCompletions);
 
     // escape and clean up the completions
     const completions = rawCompletions.map((completion: string) => {
@@ -1643,7 +1719,7 @@ export default class LoomPlugin extends Plugin {
 
   async exportToHTML(file: TFile, outputPath: string) {
     const state = this.state[file.path];
-
+    
     // Apply current filter if any
     let filteredNodes: Set<string> | null = null;
     if (state.filter) {
@@ -1652,34 +1728,34 @@ export default class LoomPlugin extends Plugin {
         filteredNodes = this.buildFilteredNodeSet(state, include, exclude);
       }
     }
-
+    
     const html = this.generateHTML(state, file, filteredNodes);
-
+    
     // Resolve the output path properly
     let resolvedPath = outputPath;
-
+    
     // Check if path is absolute (Unix/Mac starts with /, Windows with C:\ etc)
     const isAbsolute = outputPath.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(outputPath);
-
+    
     if (!isAbsolute) {
       // Relative path - place it next to the source markdown file
       const sourceDir = file.parent ? file.parent.path : '';
       resolvedPath = sourceDir ? `${sourceDir}/${outputPath}` : outputPath;
     }
-
+    
     // Use untildify to expand ~ in paths
     const finalPath = untildify(resolvedPath);
-
+    
     console.log(`Resolved export path: "${outputPath}" -> "${finalPath}"`);
-
+    
     try {
       if (!isAbsolute) {
         // For relative paths, save in the vault using Obsidian's adapter
         let vaultRelativePath: string;
-
+        
         // Save next to the source file or in vault root
         vaultRelativePath = file.parent ? `${file.parent.path}/${outputPath}` : outputPath;
-
+        
         await this.app.vault.adapter.write(vaultRelativePath, html);
         console.log(`Successfully exported using vault adapter: ${vaultRelativePath}`);
       } else {
@@ -1703,18 +1779,18 @@ export default class LoomPlugin extends Plugin {
   detectNodeType(node: Node): string {
     // If explicitly set, use that
     if (node.nodeType) return node.nodeType;
-
+    
     // Heuristic detection based on node characteristics
     if (node.generationModel || node.generationParameters) {
       return 'ai-generated';
     }
-
+    
     // Default heuristic: nodes with parents are likely AI-generated responses
     // Root nodes are typically user-created prompts
     if (node.parentId) {
       return 'ai-generated';
     }
-
+    
     // Root nodes are typically user-created
     return 'user-created';
   }
@@ -1722,9 +1798,9 @@ export default class LoomPlugin extends Plugin {
   parseFilter(filterStr: string): { include: string[], exclude: string[] } {
     const include: string[] = [];
     const exclude: string[] = [];
-
+    
     if (!filterStr.trim()) return { include, exclude };
-
+    
     const parts = filterStr.trim().split(/\s+/);
     for (const part of parts) {
       if (part.startsWith('+')) {
@@ -1735,7 +1811,7 @@ export default class LoomPlugin extends Plugin {
         include.push(part);
       }
     }
-
+    
     return { include, exclude };
   }
 
@@ -1743,17 +1819,17 @@ export default class LoomPlugin extends Plugin {
     if (include.length === 0 && exclude.length === 0) {
       return new Set(Object.keys(state.nodes));
     }
-
+    
     const directMatches = new Set<string>();
     const toHide = new Set<string>();
-
+    
     // Find nodes that directly match the filter
     for (const [id, node] of Object.entries(state.nodes)) {
       if (this.nodeMatchesFilter(node, include, exclude)) {
         directMatches.add(id);
       }
     }
-
+    
     // Hide excluded nodes and descendants
     for (const [id, node] of Object.entries(state.nodes)) {
       const nodeTags = node.tags || [];
@@ -1769,7 +1845,7 @@ export default class LoomPlugin extends Plugin {
         hideDescendants(id);
       }
     }
-
+    
     // Include ancestors of direct matches for tree connectivity
     const toShow = new Set<string>();
     for (const matchId of directMatches) {
@@ -1783,23 +1859,23 @@ export default class LoomPlugin extends Plugin {
         }
       }
     }
-
+    
     return toShow;
   }
 
   nodeMatchesFilter(node: Node, include: string[], exclude: string[]): boolean {
     const nodeTags = node.tags || [];
-
+    
     // Must have all included tags
     for (const tag of include) {
       if (!nodeTags.includes(tag)) return false;
     }
-
+    
     // Must not have any excluded tags
     for (const tag of exclude) {
       if (nodeTags.includes(tag)) return false;
     }
-
+    
     return true;
   }
 
@@ -1822,7 +1898,7 @@ export default class LoomPlugin extends Plugin {
       return new Date(timestamp).toLocaleString();
     };
 
-    const renderNodeHTML = (nodeId: string, depth: number = 0): string => {
+        const renderNodeHTML = (nodeId: string, depth: number = 0): string => {
       const node = state.nodes[nodeId];
       if (!node || (filteredNodes && !filteredNodes.has(nodeId))) return '';
 
@@ -1833,10 +1909,10 @@ export default class LoomPlugin extends Plugin {
       // Detect node type for visual indicators
       const nodeType = node.nodeType || this.detectNodeType(node);
       const nodeTypeClass = `node-type-${nodeType}`;
-      const nodeTypeIcon = nodeType === 'ai-generated' ? '&#x1F916;' : nodeType === 'user-edited' ? '&#x270F;&#xFE0F;' : '&#x1F464;';
+      const nodeTypeIcon = nodeType === 'ai-generated' ? '🤖' : nodeType === 'user-edited' ? '✏️' : '👤';
 
-      const tagsHtml = (node.tags || []).length > 0
-        ? `<div class="node-tags">${(node.tags || []).map(tag =>
+      const tagsHtml = (node.tags || []).length > 0 
+        ? `<div class="node-tags">${(node.tags || []).map(tag => 
             `<span class="tag tag-${tag}">${tag}</span>`
           ).join('')}</div>`
         : '';
@@ -1848,14 +1924,14 @@ export default class LoomPlugin extends Plugin {
           ${node.generationModel ? `<span class="model">Model: ${node.generationModel}</span>` : ''}
         </div>`;
 
-      const childrenHtml = children.length > 0
+      const childrenHtml = children.length > 0 
         ? `<div class="node-children">${children.map(childId => renderNodeHTML(childId, depth + 1)).join('')}</div>`
         : '';
 
       return `
         <div class="node ${nodeTypeClass}" data-node-id="${nodeId}" data-depth="${depth}">
          <div class="node-header">
-           ${children.length > 0 ? '<button class="collapse-button" onclick="toggleCollapse(this)">&#x25BC;</button>' : ''}
+           ${children.length > 0 ? '<button class="collapse-button" onclick="toggleCollapse(this)">▼</button>' : ''}
            <div class="node-content">
              <div class="node-text">${escapeHtml(node.text || 'No text')}</div>
              ${tagsHtml}
@@ -1893,7 +1969,7 @@ export default class LoomPlugin extends Plugin {
             display: flex;
             height: 100vh;
         }
-
+        
         .sidebar {
             width: 350px;
             background: #252526;
@@ -1902,41 +1978,41 @@ export default class LoomPlugin extends Plugin {
             padding: 20px;
             box-sizing: border-box;
         }
-
+        
         .main-content {
             flex: 1;
             padding: 20px;
             overflow-y: auto;
             background: #1e1e1e;
         }
-
+        
         .header {
             margin-bottom: 20px;
             padding-bottom: 10px;
             border-bottom: 1px solid #3e3e42;
         }
-
+        
         .header h1 {
             margin: 0;
             color: #569cd6;
             font-size: 1.5em;
         }
-
+        
         .node {
             margin: 8px 0;
             border-left: 2px solid transparent;
             transition: all 0.2s ease;
         }
-
+        
         .node:hover {
             border-left-color: #569cd6;
         }
-
+        
         .node.active {
             border-left-color: #569cd6;
             background: rgba(86, 156, 214, 0.1);
         }
-
+        
         .node-header {
             display: flex;
             align-items: flex-start;
@@ -1944,11 +2020,11 @@ export default class LoomPlugin extends Plugin {
             padding: 8px;
             border-radius: 4px;
         }
-
+        
         .node-header:hover {
             background: rgba(255, 255, 255, 0.05);
         }
-
+        
         .collapse-button {
             background: none;
             border: none;
@@ -1960,27 +2036,27 @@ export default class LoomPlugin extends Plugin {
             text-align: center;
             transition: transform 0.2s ease;
         }
-
+        
         .collapse-button.collapsed {
             transform: rotate(-90deg);
         }
-
+        
         .node-content {
             flex: 1;
             min-width: 0;
         }
-
+        
         .node-text {
             white-space: pre-wrap;
             word-wrap: break-word;
             margin-bottom: 4px;
             line-height: 1.4;
         }
-
+        
         .node-tags {
             margin: 4px 0;
         }
-
+        
         .tag {
             display: inline-block;
             background: #3e3e42;
@@ -1990,40 +2066,40 @@ export default class LoomPlugin extends Plugin {
             font-size: 0.8em;
             margin-right: 4px;
         }
-
+        
         .tag-fav { background: #f9e71e; color: #000; }
         .tag-to_continue { background: #569cd6; }
         .tag-private { background: #f44747; }
-
+        
         .node-metadata {
             font-size: 0.7em;
             color: #969696;
             margin-top: 4px;
         }
-
+        
         .node-metadata span {
             margin-right: 8px;
         }
-
+        
         .node-type-indicator {
             font-size: 1em;
             margin-right: 8px;
         }
-
+        
         .node-type-ai-generated { border-left-color: #569cd6; }
         .node-type-user-edited { border-left-color: #ff9800; }
         .node-type-user-created { border-left-color: #4caf50; }
-
+        
         .node-children {
             margin-left: 20px;
             border-left: 1px solid #3e3e42;
             padding-left: 8px;
         }
-
+        
         .node-children.collapsed {
             display: none;
         }
-
+        
         .current-text {
             background: #252526;
             border: 1px solid #3e3e42;
@@ -2034,7 +2110,7 @@ export default class LoomPlugin extends Plugin {
             line-height: 1.6;
             font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
         }
-
+        
         .export-info {
             margin-bottom: 20px;
             padding: 10px;
@@ -2042,7 +2118,7 @@ export default class LoomPlugin extends Plugin {
             border-radius: 4px;
             font-size: 0.9em;
         }
-
+        
         @media (max-width: 768px) {
             body { flex-direction: column; }
             .sidebar { width: 100%; height: 40vh; }
@@ -2059,23 +2135,23 @@ export default class LoomPlugin extends Plugin {
             ${treeHtml}
         </div>
     </div>
-
+    
     <div class="main-content">
         <div class="export-info">
             <strong>Loom Export</strong><br>
             Generated: ${new Date().toLocaleString()}<br>
             ${filteredNodes ? `Filtered nodes: ${filteredNodes.size} of ${Object.keys(state.nodes).length}` : `Total nodes: ${Object.keys(state.nodes).length}`}
         </div>
-
+        
         <div class="current-text" id="current-text">
             ${escapeHtml(currentNodeText)}
         </div>
     </div>
-
+    
     <script>
         // Full text data for each node
         const nodeFullTexts = ${JSON.stringify(nodeFullTexts)};
-
+        
         function toggleCollapse(button) {
             button.classList.toggle('collapsed');
             const nodeChildren = button.closest('.node').querySelector('.node-children');
@@ -2083,35 +2159,35 @@ export default class LoomPlugin extends Plugin {
                 nodeChildren.classList.toggle('collapsed');
             }
         }
-
+        
         function selectNode(nodeId) {
             // Remove active class from all nodes
             document.querySelectorAll('.node').forEach(n => n.classList.remove('active'));
-
+            
             // Add active class to selected node
             const selectedNode = document.querySelector(\`[data-node-id="\${nodeId}"]\`);
             if (selectedNode) {
                 selectedNode.classList.add('active');
-
+                
                 // Update main content with node's full path text
                 const fullText = nodeFullTexts[nodeId] || 'No text available';
                 document.getElementById('current-text').textContent = fullText;
-
+                
                 // Scroll the main content to top
                 document.querySelector('.main-content').scrollTop = 0;
             }
         }
-
+        
         // Add click handlers to nodes
         document.querySelectorAll('.node-header').forEach(header => {
             header.addEventListener('click', (e) => {
                 if (e.target.classList.contains('collapse-button')) return;
-
+                
                 const nodeId = header.closest('.node').dataset.nodeId;
                 selectNode(nodeId);
             });
         });
-
+        
         // Select the current node on load
         if ('${state.current}') {
             selectNode('${state.current}');
@@ -2231,6 +2307,7 @@ export default class LoomPlugin extends Plugin {
       "gpt-3.5-turbo",
       "gpt-3.5-turbo-0301",
       "gpt-4-base",
+      // TODO: llama 3.1 has "28k additional multilingual tokens", so cl100k is not exactly right
       "meta-llama/llama-3.1-8b",
       "meta-llama/llama-3.1-70b",
       "meta-llama/llama-3.1-405b",
@@ -2250,13 +2327,14 @@ export default class LoomPlugin extends Plugin {
       "davinci-codex",
       "cushman-codex",
     ];
+    // const r50kModels = ["text-davinci-001", "text-curie-001", "text-babbage-001", "text-ada-001", "davinci", "curie", "babbage", "ada"];
 
     let tokenizer;
     if (cl100kModels.includes(getPreset(this.settings).model))
       tokenizer = cl100k;
     else if (p50kModels.includes(getPreset(this.settings).model))
       tokenizer = p50k;
-    else tokenizer = r50k;
+    else tokenizer = r50k; // i expect that an unknown model will most likely be r50k
 
     return tokenizer.decode(
       tokenizer
@@ -2278,7 +2356,7 @@ export default class LoomPlugin extends Plugin {
     if (!url.endsWith("/")) url += "/";
     url = url.replace(/v1\//, "");
     url += "v1/completions";
-
+    
     let body: any = {
       prompt,
       model: getPreset(this.settings).model,
@@ -2325,10 +2403,10 @@ export default class LoomPlugin extends Plugin {
               (choice: any) => choice.text
             ),
           }
-        : {
-            ok: false,
-            status: response.status,
-            message: response.json?.error?.message || "Unknown error"
+        : { 
+            ok: false, 
+            status: response.status, 
+            message: response.json?.error?.message || "Unknown error" 
           };
 
     if (!result.ok && this.settings.logApiCalls) {
@@ -2395,6 +2473,293 @@ export default class LoomPlugin extends Plugin {
           message: responses[0].json.error.message,
         };
     return result;
+  }
+
+  probeServerUrl(): string | null {
+    // @ts-expect-error — url exists only on probe preset
+    let url: string = getPreset(this.settings)?.url || "";
+    if (!url) return null;
+    if (!(url.startsWith("http://") || url.startsWith("https://")))
+      url = "http://" + url;
+    return url.replace(/\/+$/, "");
+  }
+
+  buildIntervention() {
+    const s = this.settings;
+    if (s.steeringType === "none" || !s.steeringProbe) return null;
+    return {
+      type: s.steeringType,
+      probe: s.steeringProbe,
+      probe_index: s.steeringProbeIndex,
+      strength: s.steeringStrength,
+      renorm: s.steeringRenorm,
+    };
+  }
+
+  async fetchProbeConfig(url: string, apiKey: string): Promise<ProbeConfig | null> {
+    try {
+      const headers: Record<string, string> = {};
+      if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+      const response = await requestUrl({
+        url: `${url}/v1/config`,
+        method: "GET",
+        headers,
+        throw: false,
+      });
+      if (response.status !== 200) return null;
+      return response.json as ProbeConfig;
+    } catch (e) {
+      console.error("Failed to fetch probe config:", e);
+      return null;
+    }
+  }
+
+  async refreshProbeConfig() {
+    const url = this.probeServerUrl();
+    if (!url) {
+      new Notice("No probe server URL set.");
+      return;
+    }
+    const preset = getPreset(this.settings);
+    const config = await this.fetchProbeConfig(url, preset.apiKey || "");
+    if (!config) {
+      new Notice(`Failed to fetch probe config from ${url}`);
+      return;
+    }
+    this.settings.probeConfigs[url] = config;
+    if (!this.settings.steeringProbe && config.probes.length > 0) {
+      this.settings.steeringProbe = config.probes[0].name;
+    }
+    await this.saveAndRender();
+    new Notice(`Loaded ${config.probes.length} probe set(s) from ${config.model}`);
+  }
+
+  async singleProbeCompletion(
+    url: string,
+    apiKey: string,
+    prompt: string,
+    intervention: any,
+  ): Promise<{ ok: true; text: string } | { ok: false; status: number; message: string }> {
+    const body: any = {
+      prompt,
+      stream: true,
+      max_tokens: this.settings.maxTokens,
+      temperature: this.settings.temperature,
+      top_p: this.settings.topP,
+      probes: [],
+    };
+    if (intervention) body.intervention = intervention;
+
+    if (this.settings.logApiCalls) {
+      console.log("Probe server request:", { url, body });
+    }
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+    let response: Response;
+    try {
+      response = await fetch(`${url}/v1/completions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      return { ok: false, status: 0, message: String(e) };
+    }
+
+    if (!response.ok || !response.body) {
+      const message = await response.text().catch(() => "");
+      return { ok: false, status: response.status, message: message || "Request failed" };
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let text = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let lineEnd: number;
+      while ((lineEnd = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, lineEnd).trim();
+        buffer = buffer.slice(lineEnd + 1);
+        if (!line.startsWith("data: ")) continue;
+        const payload = line.slice(6);
+        if (payload === "[DONE]") continue;
+        try {
+          const chunk = JSON.parse(payload);
+          const delta = chunk.choices?.[0];
+          if (delta?.text) text += delta.text;
+          else if (delta?.delta?.content) text += delta.delta.content;
+        } catch {
+          // keepalive or partial — ignore
+        }
+      }
+    }
+
+    return { ok: true, text };
+  }
+
+  async completeProbe(prompt: string): Promise<CompletionResult> {
+    const url = this.probeServerUrl();
+    if (!url) {
+      return { ok: false, status: 0, message: "Probe server URL is not set." };
+    }
+    const apiKey = getPreset(this.settings).apiKey || "";
+    const intervention = this.buildIntervention();
+
+    const requests = Array(this.settings.n)
+      .fill(null)
+      .map(() => this.singleProbeCompletion(url, apiKey, prompt, intervention));
+    const results = await Promise.all(requests);
+
+    const failed = results.find((r) => !r.ok) as
+      | { ok: false; status: number; message: string }
+      | undefined;
+    if (failed) {
+      return { ok: false, status: failed.status, message: failed.message };
+    }
+    return {
+      ok: true,
+      completions: results.map((r) => (r as { ok: true; text: string }).text),
+    };
+  }
+
+  async probeDocument(file: TFile) {
+    const url = this.probeServerUrl();
+    if (!url) {
+      new Notice("No probe server URL set — select a probe-server preset.");
+      return;
+    }
+    const probeName = this.settings.steeringProbe;
+    if (!probeName) {
+      new Notice("No probe selected. Click \"Refresh probes\" in Settings → Loom.");
+      return;
+    }
+    const config = this.settings.probeConfigs[url];
+    if (!config) {
+      new Notice("No probe config cached. Click \"Refresh probes\" first.");
+      return;
+    }
+    const probeInfo = config.probes.find((p) => p.name === probeName);
+    if (!probeInfo) {
+      new Notice(`Probe "${probeName}" not found on server.`);
+      return;
+    }
+
+    const text = this.editor.getValue();
+    if (!text.trim()) {
+      new Notice("Document is empty.");
+      return;
+    }
+
+    const preset = getPreset(this.settings);
+    const apiKey = preset.apiKey || "";
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+    const body = {
+      texts: [text],
+      layers: [probeInfo.layer],
+      project: [probeName],
+      aggregate: "tokens",
+      skip_tokens: 1,
+      max_length: Math.max(2048, Math.min(32768, text.length)),
+      return_tokens: true,
+    };
+
+    this.statusBarItem.style.display = "inline-flex";
+    new Notice("Probing document...");
+
+    let response;
+    try {
+      response = await requestUrl({
+        url: `${url}/v1/encode`,
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        throw: false,
+      });
+    } catch (e) {
+      this.statusBarItem.style.display = "none";
+      new Notice(`Probe request failed: ${e}`);
+      return;
+    }
+    this.statusBarItem.style.display = "none";
+
+    if (response.status !== 200) {
+      new Notice(`Probe failed (${response.status}): ${response.text?.slice(0, 200) || ""}`);
+      return;
+    }
+
+    console.log("[loom probe] encode response keys:", Object.keys(response.json));
+    const result = response.json.results?.[0];
+    if (!result) {
+      new Notice("Probe response missing results.");
+      return;
+    }
+    console.log("[loom probe] result keys:", Object.keys(result));
+    const layerKey = `layer_${probeInfo.layer}`;
+    const probeMatrix: number[][] = result[layerKey]?.[probeName];
+    const tokens: string[] =
+      result.tokens ||
+      response.json.token_strings?.[0] ||
+      response.json.tokens?.[0] ||
+      result.token_strings ||
+      [];
+    console.log(
+      `[loom probe] matrix=${probeMatrix?.length}×${probeMatrix?.[0]?.length}, tokens=${tokens.length}`
+    );
+    console.log(
+      "[loom probe] first 15 tokens (JSON):",
+      JSON.stringify(tokens.slice(0, 15))
+    );
+    console.log(
+      "[loom probe] doc head (JSON):",
+      JSON.stringify(this.editor.getValue().slice(0, 80))
+    );
+    if (!probeMatrix || !tokens.length) {
+      new Notice("Probe response missing per-token data (check server return_tokens support).");
+      console.error("Encode result:", response.json);
+      return;
+    }
+
+    // Server returns `tokens` already aligned 1:1 with projection rows.
+    const n = Math.min(tokens.length, probeMatrix.length);
+
+    const readout: ProbeReadout = {
+      tokens: tokens.slice(0, n),
+      projections: probeMatrix.slice(0, n),
+      labels: probeInfo.labels,
+      probeName,
+      selectedIndex: this.settings.steeringProbeIndex,
+    };
+    this.probeReadouts[file.path] = readout;
+    this.applyProbeReadout(readout);
+    new Notice(`Probed ${n} tokens with ${probeName}`);
+  }
+
+  applyProbeReadout(readout: ProbeReadout | null) {
+    if (!this.editor) return;
+    // @ts-expect-error — cm is CodeMirror view
+    const cmView = this.editor.cm;
+    if (!cmView) return;
+    cmView.dispatch({
+      effects: setProbeReadoutEffect.of(readout),
+    });
+  }
+
+  clearProbeReadout(file: TFile) {
+    delete this.probeReadouts[file.path];
+    this.applyProbeReadout(null);
   }
 
   async completeOpenAI(prompt: string) {
@@ -2574,6 +2939,7 @@ export default class LoomPlugin extends Plugin {
 
   async getAnthropicResponse(prompt: string) {
     prompt = this.trimOpenAIPrompt(prompt);
+    // let result: CompletionResult;
     const body = JSON.stringify(
       {
         model: getPreset(this.settings).model,
@@ -2588,7 +2954,9 @@ export default class LoomPlugin extends Plugin {
       null,
       2
     );
+    
 
+    
     if (this.settings.logApiCalls) {
       console.log(`request body: ${body}`);
     }
@@ -2610,6 +2978,9 @@ export default class LoomPlugin extends Plugin {
       }
 
       const result = response.json.content[0]?.text || "<no text>";
+
+      // ? { ok: true, completions: [response.json.content[0]?.text || "<no text>"] }
+      // : { ok: false, status: response.status, message: "" };
 
       if (this.settings.logApiCalls) {
         console.log(result);
@@ -2642,7 +3013,7 @@ export default class LoomPlugin extends Plugin {
     if (!preset.apiKey.includes(':')) {
       throw new Error('Bedrock API key must be in format: accessKeyId:secretAccessKey');
     }
-
+    
     const body = JSON.stringify({
       anthropic_version: "bedrock-2023-05-31",
       max_tokens: this.settings.maxTokens,
@@ -2659,25 +3030,28 @@ export default class LoomPlugin extends Plugin {
     }
 
     // Try direct HTTP implementation first, with Node.js fallback
+    // AWS SDK doesn't work reliably in Obsidian's Electron renderer process
     try {
       return await this.getBedrockResponseDirect(prompt);
     } catch (obsidianError) {
+      // Fallback to Node.js https if Obsidian requestUrl fails
       return await this.getBedrockResponseNodeJS(prompt);
     }
   }
 
   async getBedrockResponseDirect(prompt: string) {
+    // Fallback implementation using direct HTTP requests with AWS signature v4
     prompt = this.trimOpenAIPrompt(prompt);
     const preset = getPreset(this.settings);
-
+    
     if (!preset.apiKey.includes(':')) {
       throw new Error('Bedrock API key must be in format: accessKeyId:secretAccessKey');
     }
-
+    
     const [accessKeyId, secretAccessKey] = preset.apiKey.split(':');
     // @ts-expect-error - Bedrock preset has region property
     const region = preset.region || 'us-east-1';
-
+    
     const body = JSON.stringify({
       anthropic_version: "bedrock-2023-05-31",
       max_tokens: this.settings.maxTokens,
@@ -2691,7 +3065,7 @@ export default class LoomPlugin extends Plugin {
 
     const host = `bedrock-runtime.${region}.amazonaws.com`;
     const url = `https://${host}/model/${preset.model}/invoke`;
-
+    
     // Create AWS signature v4
     const awsSignature = this.createAwsSignature({
       method: 'POST',
@@ -2704,7 +3078,7 @@ export default class LoomPlugin extends Plugin {
       accessKeyId,
       secretAccessKey,
       region,
-      service: 'bedrock'
+      service: 'bedrock'  // AWS requires 'bedrock' for credential scope
     });
 
     try {
@@ -2726,13 +3100,14 @@ export default class LoomPlugin extends Plugin {
       }
 
       return response.json?.content?.[0]?.text || "<no text>";
-
+      
     } catch (e) {
       throw e;
     }
   }
 
   async getBedrockResponseNodeJS(prompt: string) {
+    // Alternative implementation using Node.js built-ins (https module)
     prompt = this.trimOpenAIPrompt(prompt);
     const preset = getPreset(this.settings);
     // @ts-expect-error - Bedrock preset has region property
@@ -2741,9 +3116,9 @@ export default class LoomPlugin extends Plugin {
     if (!preset.apiKey.includes(':')) {
       throw new Error('Bedrock API key must be in format: accessKeyId:secretAccessKey');
     }
-
+    
     const [accessKeyId, secretAccessKey] = preset.apiKey.split(':');
-
+    
     const body = JSON.stringify({
       anthropic_version: "bedrock-2023-05-31",
       max_tokens: this.settings.maxTokens,
@@ -2757,7 +3132,7 @@ export default class LoomPlugin extends Plugin {
 
     const host = `bedrock-runtime.${region}.amazonaws.com`;
     const url = `https://${host}/model/${preset.model}/invoke`;
-
+    
     // Create AWS signature v4
     const awsSignature = this.createAwsSignature({
       method: 'POST',
@@ -2776,7 +3151,7 @@ export default class LoomPlugin extends Plugin {
     return new Promise<string>((resolve, reject) => {
       const https = require('https');
       const urlObj = new URL(url);
-
+      
       const options = {
         hostname: urlObj.hostname,
         port: 443,
@@ -2787,11 +3162,11 @@ export default class LoomPlugin extends Plugin {
 
       const req = https.request(options, (res: any) => {
         let responseBody = '';
-
+        
         res.on('data', (chunk: any) => {
           responseBody += chunk;
         });
-
+        
         res.on('end', () => {
           if (res.statusCode === 200) {
             try {
@@ -2806,11 +3181,11 @@ export default class LoomPlugin extends Plugin {
           }
         });
       });
-
+      
       req.on('error', (error: any) => {
         reject(error);
       });
-
+      
       req.write(body);
       req.end();
     });
@@ -2827,34 +3202,34 @@ export default class LoomPlugin extends Plugin {
     service: string;
   }) {
     const crypto = require('crypto');
-
+    
     const { method, url, headers, body, accessKeyId, secretAccessKey, region, service } = params;
     const urlParts = new URL(url);
     const host = urlParts.hostname;
     // URL encode the path properly for AWS signature
     const path = encodeURI(urlParts.pathname).replace(/:/g, '%3A');
-    const queryString = urlParts.search.substring(1);
-
+    const queryString = urlParts.search.substring(1); // Remove leading ?
+    
     const now = new Date();
     const amzDate = now.toISOString().replace(/[:\-]|\.\d{3}/g, '');
     const dateStamp = amzDate.substring(0, 8);
-
+    
     const payloadHash = crypto.createHash('sha256').update(body).digest('hex');
-
+    
     // Build canonical headers (must be sorted)
     const requiredHeaders: Record<string, string> = {
       'content-type': 'application/json',
       'host': host,
       'x-amz-date': amzDate
     };
-
+    
     const canonicalHeaderNames = Object.keys(requiredHeaders).sort();
     const canonicalHeaders = canonicalHeaderNames
       .map(name => `${name}:${requiredHeaders[name]}`)
       .join('\n') + '\n';
-
+    
     const signedHeaders = canonicalHeaderNames.join(';');
-
+    
     // Build canonical request
     const canonicalRequest = [
       method.toUpperCase(),
@@ -2864,7 +3239,7 @@ export default class LoomPlugin extends Plugin {
       signedHeaders,
       payloadHash
     ].join('\n');
-
+    
     // Build string to sign
     const algorithm = 'AWS4-HMAC-SHA256';
     const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
@@ -2874,7 +3249,7 @@ export default class LoomPlugin extends Plugin {
       credentialScope,
       crypto.createHash('sha256').update(canonicalRequest).digest('hex')
     ].join('\n');
-
+    
     // Generate signing key
     const getSignatureKey = (key: string, dateStamp: string, regionName: string, serviceName: string) => {
       const kDate = crypto.createHmac('sha256', 'AWS4' + key).update(dateStamp).digest();
@@ -2883,12 +3258,12 @@ export default class LoomPlugin extends Plugin {
       const kSigning = crypto.createHmac('sha256', kService).update('aws4_request').digest();
       return kSigning;
     };
-
+    
     const signingKey = getSignatureKey(secretAccessKey, dateStamp, region, service);
     const signature = crypto.createHmac('sha256', signingKey).update(stringToSign).digest('hex');
-
+    
     const authorizationHeader = `${algorithm} Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
-
+    
     return {
       headers: {
         'Content-Type': 'application/json',
@@ -2913,7 +3288,7 @@ export default class LoomPlugin extends Plugin {
       this.state = legacyState;
       this.storage = new LegacyStorage(this.app, this, this.state);
     }
-
+    
     // Load all states through storage interface
     this.state = await this.storage.loadAllStates();
   }
@@ -2921,16 +3296,16 @@ export default class LoomPlugin extends Plugin {
   async save() {
     // Save settings separately (always using the plugin's data.json)
     await this.saveData({ settings: this.settings, state: this.state });
-
+    
     // If using document storage, we only save settings to data.json
     if (this.settings.useDocumentStorage) {
       await this.saveData({ settings: this.settings, state: {} });
     }
-
+    
     this.initializeProviders();
   }
 
-  // Properly refresh all views
+  // Add this new method to properly refresh all views
   private refreshViews() {
     // Refresh Loom views
     this.app.workspace.getLeavesOfType("loom").forEach((leaf) => {
@@ -2939,7 +3314,7 @@ export default class LoomPlugin extends Plugin {
       }
     });
 
-    // Refresh Loom siblings views
+    // Refresh Loom siblings views  
     this.app.workspace.getLeavesOfType("loom-siblings").forEach((leaf) => {
       if (leaf.view instanceof LoomSiblingsView) {
         leaf.view.render();
@@ -2947,6 +3322,7 @@ export default class LoomPlugin extends Plugin {
     });
   }
 
+  // Update saveAndRender to use the new refresh method
   async saveAndRender() {
     // When using document storage, we need to save the current file's state
     if (this.settings.useDocumentStorage) {
@@ -2978,6 +3354,8 @@ export default class LoomPlugin extends Plugin {
    * Convert legacy monolithic state to per-document `.loom.json` files.
    */
   async migrateToDocumentStorage() {
+    // Migration can run irrespective of current storage mode. If files already exist it will overwrite/update them.
+
     const docStorage = new DocumentStorage(this.app, this.settings);
     const legacyStates = { ...this.state };
     const errors: string[] = [];
@@ -3002,7 +3380,7 @@ export default class LoomPlugin extends Plugin {
       return;
     }
 
-    // Success - switch to document storage
+    // Success – switch to document storage
     this.state = {};
     this.settings.useDocumentStorage = true;
     await this.save();
@@ -3314,6 +3692,10 @@ class LoomSettingTab extends PluginSettingTab {
             ...preset,
             // @ts-expect-error
             apiKey: this.plugin.settings.anthropicApiKey || "",
+            // // @ts-expect-error
+            // systemPrompt: this.plugin.settings.anthropicSystemPrompt || "",
+            // // @ts-expect-error
+            // userMessage: this.plugin.settings.anthropicUserMessage || "",
           };
           break;
         }
@@ -3321,7 +3703,7 @@ class LoomSettingTab extends PluginSettingTab {
           preset = {
             ...preset,
             // @ts-expect-error
-            apiKey: "",
+            apiKey: "", // User will need to provide accessKeyId:secretAccessKey format
             region: "us-east-1",
           };
           break;
@@ -3378,6 +3760,7 @@ class LoomSettingTab extends PluginSettingTab {
           cohere: "Cohere",
           textsynth: "TextSynth",
           bedrock: "Amazon Bedrock",
+          probe: "Probe server (assistant-axis)",
         };
         dropdown.addOptions(options);
         dropdown.setValue(
@@ -3461,7 +3844,7 @@ class LoomSettingTab extends PluginSettingTab {
       }
 
       if (
-        ["openai-compat", "azure", "azure-chat"].includes(
+        ["openai-compat", "azure", "azure-chat", "probe"].includes(
           this.plugin.settings.modelPresets[this.plugin.settings.modelPreset]
             .provider
         )
@@ -3472,7 +3855,7 @@ class LoomSettingTab extends PluginSettingTab {
               this.plugin.settings.modelPresets[
                 this.plugin.settings.modelPreset
               // @ts-expect-error TODO
-              ].url
+              ].url || ""
             )
             .onChange(async (value) => {
               this.plugin.settings.modelPresets[
@@ -3482,6 +3865,25 @@ class LoomSettingTab extends PluginSettingTab {
               await this.plugin.save();
             })
         );
+      }
+
+      if (
+        this.plugin.settings.modelPresets[this.plugin.settings.modelPreset]
+          .provider === "probe"
+      ) {
+        new Setting(presetFields)
+          .setName("Probe config")
+          .setDesc(
+            "Fetch available probe sets and labels from the probe server."
+          )
+          .addButton((button) =>
+            button
+              .setButtonText("Refresh probes")
+              .onClick(async () => {
+                await this.plugin.refreshProbeConfig();
+                updatePresetFields();
+              })
+          );
       }
 
       if (this.plugin.settings.modelPresets[this.plugin.settings.modelPreset].provider === "bedrock") {
@@ -3568,6 +3970,8 @@ class LoomSettingTab extends PluginSettingTab {
 
     updatePresetFields();
     updatePresetList();
+
+    // TODO simplify below?
 
     const passagesHeader = containerEl.createDiv({
       cls: "setting-item setting-item-heading",
@@ -3667,7 +4071,7 @@ class LoomSettingTab extends PluginSettingTab {
           })
       );
 
-    // Storage location dropdown
+    // Storage location dropdown (always visible, disabled until enabled)
     new Setting(containerEl)
       .setName("Storage location")
       .setDesc("Where to store .loom.json files")
@@ -3685,7 +4089,7 @@ class LoomSettingTab extends PluginSettingTab {
       )
       .setDisabled(!this.plugin.settings.useDocumentStorage);
 
-    // Migration command
+    // Migration command (always visible)
     containerEl.createEl("p", {
       text: "Convert existing looms to per-document storage:",
       cls: "setting-item-description",

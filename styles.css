@@ -444,3 +444,75 @@ body {
 .loom__html-export-button:hover {
   background-color: var(--color-accent-hover);
 }
+
+.loom__steering {
+  margin-top: var(--size-4-3);
+  padding-top: var(--size-4-2);
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.loom__steering h4 {
+  margin: 0 0 var(--size-4-2) 0;
+}
+
+.loom__steering-hint {
+  color: var(--text-faint);
+  font-size: var(--font-ui-small);
+  margin: var(--size-4-1) 0;
+}
+
+.loom__steering-buttons {
+  display: flex;
+  gap: var(--size-4-2);
+  margin: var(--size-4-2) 0;
+}
+
+.loom__probe-token {
+  border-bottom: 1px dotted var(--text-accent);
+  cursor: help;
+}
+.loom__probe-token:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.loom__probe-tooltip {
+  position: absolute;
+  z-index: 10000;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: var(--size-4-2);
+  box-shadow: var(--shadow-s);
+  font-size: var(--font-ui-small);
+  min-width: 200px;
+  pointer-events: none;
+}
+.loom__probe-tooltip-header {
+  font-weight: 600;
+  margin-bottom: var(--size-4-1);
+  color: var(--text-muted);
+}
+.loom__probe-tooltip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--size-4-3);
+  font-family: var(--font-monospace);
+}
+.loom__probe-tooltip-label {
+  color: var(--text-normal);
+}
+.loom__probe-tooltip-value {
+  font-weight: 600;
+}
+
+.loom__probe-tooltip-separator {
+  height: 1px;
+  background: var(--background-modifier-border);
+  margin: var(--size-4-1) 0;
+}
+.loom__probe-tooltip-row-selected {
+  font-weight: 700;
+  background: var(--background-modifier-active-hover);
+  padding: 0 var(--size-4-1);
+  border-radius: var(--radius-s);
+}
