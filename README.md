@@ -66,9 +66,9 @@ Navigation:
 In the editor:
 - `Shift+click` on the text corresponding to a node to switch to it
 
-**Upstream Loom can be installed in the Obsidian store.** This fork (probe server / steering / readouts) is not yet in the store, so install it manually.
+**Installation.** [Upstream Loom](https://github.com/cosmicoptima/loom) is available in the Obsidian community plugin store, but it's been unmaintained for a while. This fork adds the probe-server provider, steering, readouts, storage/tags/export, and other work, and is not in the store — install it manually.
 
-### Manual install (temporary, until this fork ships a release)
+### Manual install
 
 Obsidian plugins consist of up to four files in a single folder:
 
