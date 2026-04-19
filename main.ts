@@ -14,6 +14,9 @@ import {
   NoteState,
   getPreset,
 } from "./common";
+import { LoomStorage } from "./storage";
+import { LegacyStorage } from "./legacyStorage";
+import { DocumentStorage } from "./documentStorage";
 import {
   App,
   Editor,
@@ -25,6 +28,7 @@ import {
   TFile,
   requestUrl,
   setIcon,
+  Modal,
 } from "obsidian";
 import { ViewPlugin } from "@codemirror/view";
 
@@ -87,15 +91,119 @@ const DEFAULT_SETTINGS: LoomSettings = {
   showSearchBar: false,
   showNodeBorders: false,
   showExport: false,
+  developerMode: false,
+
+  // Storage settings
+  useDocumentStorage: false,
+  documentStorageLocation: 'alongside',
+  autoMigrateOnSwitch: false,
 };
 
 type CompletionResult =
   | { ok: true; completions: string[] }
   | { ok: false; status: number; message: string };
 
+/** Simple confirmation modal with OK/Cancel buttons */
+class ConfirmMigrationModal extends Modal {
+  private onConfirm: () => void;
+
+  constructor(app: App, onConfirm: () => void) {
+    super(app);
+    this.onConfirm = onConfirm;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl('h3', { text: 'Migrate to Document Storage' });
+    contentEl.createEl('p', {
+      text: 'This will convert all your existing looms into per-document files. Make sure you have a backup before continuing.'
+    });
+
+    const buttons = contentEl.createDiv({ cls: 'modal-button-container' });
+    const cancelBtn = buttons.createEl('button', { text: 'Cancel' });
+    const continueBtn = buttons.createEl('button', { text: 'Continue' });
+
+    cancelBtn.addEventListener('click', () => this.close());
+    continueBtn.addEventListener('click', () => {
+      this.close();
+      this.onConfirm();
+    });
+  }
+}
+
+/** HTML Export path input modal */
+class HTMLExportModal extends Modal {
+  private onConfirm: (path: string) => void;
+  private defaultPath: string;
+
+  constructor(app: App, defaultPath: string, onConfirm: (path: string) => void) {
+    super(app);
+    this.defaultPath = defaultPath;
+    this.onConfirm = onConfirm;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl('h3', { text: 'Export Loom as HTML' });
+    contentEl.createEl('p', {
+      text: 'This will create a self-contained HTML file that can be shared with anyone.'
+    });
+
+    const pathInfo = contentEl.createEl('div', { cls: 'setting-item-description' });
+    pathInfo.innerHTML = `
+      <p><strong>Path options:</strong></p>
+      <ul>
+        <li><code>${this.defaultPath}</code> - saves next to your markdown file</li>
+        <li><code>~/Desktop/${this.defaultPath}</code> - saves to Desktop</li>
+        <li><code>/full/path/to/${this.defaultPath}</code> - saves to specific location</li>
+      </ul>
+    `;
+
+    const inputContainer = contentEl.createDiv({ cls: 'setting-item' });
+    inputContainer.createDiv({ cls: 'setting-item-name', text: 'Export path:' });
+    const inputControl = inputContainer.createDiv({ cls: 'setting-item-control' });
+
+    const pathInput = inputControl.createEl('input', {
+      type: 'text',
+      value: this.defaultPath,
+      placeholder: 'filename.html or /full/path/filename.html'
+    });
+    pathInput.style.width = '100%';
+
+    const buttons = contentEl.createDiv({ cls: 'modal-button-container' });
+    const cancelBtn = buttons.createEl('button', { text: 'Cancel' });
+    const exportBtn = buttons.createEl('button', { text: 'Export HTML', cls: 'mod-cta' });
+
+    cancelBtn.addEventListener('click', () => this.close());
+    exportBtn.addEventListener('click', () => {
+      const path = pathInput.value.trim();
+      if (path) {
+        // Ensure .html extension
+        const finalPath = path.endsWith('.html') ? path : path + '.html';
+        this.close();
+        this.onConfirm(finalPath);
+      }
+    });
+
+    // Focus the input and select the filename part (without .html)
+    pathInput.focus();
+    if (this.defaultPath.endsWith('.html')) {
+      pathInput.setSelectionRange(0, this.defaultPath.length - 5);
+    }
+
+    // Allow Enter key to export
+    pathInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        exportBtn.click();
+      }
+    });
+  }
+}
+
 export default class LoomPlugin extends Plugin {
   settings: LoomSettings;
   state: Record<string, NoteState>;
+  storage: LoomStorage;
 
   editor: Editor;
   statusBarItem: HTMLElement;
@@ -113,14 +221,21 @@ export default class LoomPlugin extends Plugin {
     return callback(file);
   }
 
-  thenSaveAndRender(callback: () => void) {
-    callback();
-    this.saveAndRender();
+  thenSaveAndRender(callback: () => void | Promise<void>) {
+    const result = callback();
+    if (result instanceof Promise) {
+      result.then(() => this.saveAndRender());
+    } else {
+      this.saveAndRender();
+    }
   }
 
-  wftsar(callback: (file: TFile) => void) {
-    this.thenSaveAndRender(() => {
-      this.withFile(callback);
+  wftsar(callback: (file: TFile) => void | Promise<void>) {
+    this.thenSaveAndRender(async () => {
+      const result = this.withFile(callback);
+      if (result instanceof Promise) {
+        await result;
+      }
     });
   }
 
@@ -152,15 +267,10 @@ export default class LoomPlugin extends Plugin {
         })
       );
     } else if (preset.provider == "anthropic") {
-      //(property) ClientOptions.fetch?: Fetch | undefined
-      //Specify a custom fetch function implementation.
-      //If not provided, we use node-fetch on Node.js and otherwise expect that fetch is defined globally.
-      // expects Promise<Response> as return value
       this.anthropicApiKey = preset.apiKey;
 
       this.anthropic = new Anthropic({
         apiKey: preset.apiKey,
-        // fetch:
         defaultHeaders: {
           "anthropic-version": "2023-06-01",
           "anthropic-beta": "messages-2023-12-15",
@@ -181,30 +291,47 @@ export default class LoomPlugin extends Plugin {
   newNode(
     text: string,
     parentId: string | null,
-    unread: boolean = false
+    unread: boolean = false,
+    nodeType: 'ai-generated' | 'user-edited' | 'user-created' = 'user-created'
   ): [string, Node] {
     const id = uuidv4();
+    const now = Date.now();
     const node: Node = {
       text,
       parentId,
       collapsed: false,
       unread,
-      bookmarked: false,
+      tags: [],
       searchResultState: null,
+
+      // New metadata fields
+      nodeType,
+      createdTimestamp: now,
+      reReadTimestamps: [],
     };
     return [id, node];
   }
 
   initializeNoteState(file: TFile) {
-    const [rootId, root] = this.newNode(this.editor.getValue(), null);
+    const [current, node] = this.newNode(this.editor.getValue(), null);
     this.state[file.path] = {
-      current: rootId,
+      current,
       hoisted: [] as string[],
       searchTerm: "",
-      nodes: { [rootId]: root },
+      filter: "",
+      nodes: { [current]: node },
       generating: null,
     };
     this.saveAndRender();
+
+    // Migrate any old bookmarked nodes to fav tag
+    Object.values(this.state[file.path].nodes).forEach(node => {
+      if ((node as any).bookmarked) {
+        if (!node.tags) node.tags = [];
+        if (!node.tags.includes('fav')) node.tags.push('fav');
+        delete (node as any).bookmarked;
+      }
+    });
   }
 
   ancestors(file: TFile, id: string): string[] {
@@ -331,10 +458,10 @@ export default class LoomPlugin extends Plugin {
 
     this.addCommand({
       id: "bookmark",
-      name: "Bookmark current node",
+      name: "Toggle favorite tag on current node",
       checkCallback: (checking: boolean) =>
         withState(checking, (state) => {
-          this.app.workspace.trigger("loom:toggle-bookmark", state.current);
+          this.app.workspace.trigger("loom:toggle-tag", { id: state.current, tag: 'fav' });
         }),
       hotkeys: [{ modifiers: ["Ctrl"], key: "b" }],
     });
@@ -612,14 +739,46 @@ export default class LoomPlugin extends Plugin {
     this.addCommand({
       id: "debug-reset-state",
       name: "Debug: Reset state",
-      callback: () => this.thenSaveAndRender(() => (this.state = {})),
+      callback: () => this.thenSaveAndRender(() => { this.state = {}; }),
     });
 
     this.addCommand({
       id: "debug-reset-hoist-stack",
       name: "Debug: Reset hoist stack",
       callback: () =>
-        this.wftsar((file) => (this.state[file.path].hoisted = [])),
+        this.wftsar((file) => { this.state[file.path].hoisted = []; }),
+    });
+
+    this.addCommand({
+      id: "export-html",
+      name: "Export as HTML",
+      callback: () => {
+        console.log("HTML export command triggered!");
+
+        const file = this.app.workspace.getActiveFile();
+        if (!file) {
+          new Notice("No active file to export");
+          return;
+        }
+
+        if (!this.state[file.path] || !this.state[file.path].nodes) {
+          new Notice("No loom data found for this file. Try generating some completions first.");
+          return;
+        }
+
+        console.log("Exporting loom for:", file.path);
+        const defaultPath = file.basename + ".html";
+
+        new HTMLExportModal(this.app, defaultPath, (inputPath) => {
+          console.log("Export path selected:", inputPath);
+          try {
+            this.app.workspace.trigger("loom:export-html", inputPath);
+          } catch (error) {
+            console.error("Export error:", error);
+            new Notice(`Export failed: ${(error as Error).message}`);
+          }
+        }).open();
+      },
     });
 
     this.registerView(
@@ -639,6 +798,48 @@ export default class LoomPlugin extends Plugin {
       loomEditorPluginSpec
     );
     this.registerEditorExtension([loomEditorPlugin]);
+
+    this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
+      const target = evt.target as HTMLElement;
+
+      // Find the nearest anchor element
+      const link = target.closest('a');
+      if (!link) {
+        return;
+      }
+
+      // Determine the target text that might contain our loom hash
+      let targetText: string | null = link.getAttribute('href');
+      if (!targetText || targetText === '#' || targetText === '') {
+        targetText = link.getAttribute('data-href');
+      }
+      if (!targetText || targetText === '#' || targetText === '') {
+        targetText = link.textContent || '';
+      }
+
+      if (!targetText) return;
+
+      // Strip leading [[ and trailing ]] if present
+      targetText = targetText.replace(/^\[\[/, '').replace(/\]\]$/, '');
+
+      if (targetText.includes('#loom=')) {
+        console.log(`Loom: Found loom link: ${targetText}`);
+        evt.preventDefault();
+        evt.stopPropagation();
+
+        const [path, hash] = targetText.split('#');
+        if (hash && hash.startsWith('loom=')) {
+          const nodeId = hash.substring(5);
+
+          this.app.workspace.openLinkText(path, '', false).then(() => {
+            setTimeout(() => {
+              console.log(`Loom: Triggering loom:switch-to with ID: ${nodeId}`);
+              this.app.workspace.trigger("loom:switch-to", nodeId);
+            }, 100);
+          });
+        }
+      }
+    }, { capture: true });
 
     this.registerEvent(
       this.app.workspace.on(
@@ -660,6 +861,7 @@ export default class LoomPlugin extends Plugin {
               current,
               hoisted: [] as string[],
               searchTerm: "",
+              filter: "",
               nodes: { [current]: node },
               generating: null,
             };
@@ -757,38 +959,13 @@ export default class LoomPlugin extends Plugin {
           );
 
           // update the editor's text
-          // const cursor = this.editor.getCursor();
-          // const linesBefore = this.editor.getValue().split("\n");
           this.editor.setValue(this.fullText(file, id));
 
           // always move cursor to the end of the editor
           const line = this.editor.lineCount() - 1;
           const ch = this.editor.getLine(line).length;
           this.editor.setCursor({ line, ch });
-          // return;
 
-          // // if the cursor is at the beginning of the editor, move it to the end
-          // if(cursor.line === 0 && cursor.ch === 0) {
-          //   const line = this.editor.lineCount() - 1;
-          //   const ch = this.editor.getLine(line).length;
-          //   this.editor.setCursor({ line, ch });
-          //   return;
-          // }
-
-          // // if the text preceding the cursor has changed, move the cursor to the end of the text
-          // // otherwise, restore the cursor position
-          //     const linesAfter = this.editor
-          //       .getValue()
-          //       .split("\n")
-          //       .slice(0, cursor.line + 1);
-          //     for (let i = 0; i < cursor.line; i++)
-          //       if (linesBefore[i] !== linesAfter[i]) {
-          //         const line = this.editor.lineCount() - 1;
-          //         const ch = this.editor.getLine(line).length;
-          //         this.editor.setCursor({ line, ch });
-          //               return;
-          //       }
-          // this.editor.setCursor(cursor);
           this.saveAndRender(); // Add explicit view refresh
         })
       )
@@ -798,9 +975,10 @@ export default class LoomPlugin extends Plugin {
       // @ts-expect-error
       this.app.workspace.on("loom:toggle-collapse", (id: string) =>
         this.wftsar(
-          (file) =>
-            (this.state[file.path].nodes[id].collapsed =
-              !this.state[file.path].nodes[id].collapsed)
+          (file) => {
+            this.state[file.path].nodes[id].collapsed =
+              !this.state[file.path].nodes[id].collapsed;
+          }
         )
       )
     );
@@ -808,24 +986,31 @@ export default class LoomPlugin extends Plugin {
     this.registerEvent(
       // @ts-expect-error
       this.app.workspace.on("loom:hoist", (id: string) =>
-        this.wftsar((file) => this.state[file.path].hoisted.push(id))
+        this.wftsar((file) => { this.state[file.path].hoisted.push(id); })
       )
     );
 
     this.registerEvent(
       // @ts-expect-error
       this.app.workspace.on("loom:unhoist", () =>
-        this.wftsar((file) => this.state[file.path].hoisted.pop())
+        this.wftsar((file) => { this.state[file.path].hoisted.pop(); })
       )
     );
 
     this.registerEvent(
       // @ts-expect-error
-      this.app.workspace.on("loom:toggle-bookmark", (id: string) =>
+      this.app.workspace.on("loom:toggle-tag", ({ id, tag }: { id: string; tag: string }) =>
         this.wftsar(
-          (file) =>
-            (this.state[file.path].nodes[id].bookmarked =
-              !this.state[file.path].nodes[id].bookmarked)
+          (file) => {
+            const node = this.state[file.path].nodes[id];
+            if (!node.tags) node.tags = [];
+            const idx = node.tags.indexOf(tag);
+            if (idx >= 0) {
+              node.tags.splice(idx, 1);
+            } else {
+              node.tags.push(tag);
+            }
+          }
         )
       )
     );
@@ -1109,12 +1294,40 @@ export default class LoomPlugin extends Plugin {
     this.registerEvent(
       // @ts-expect-error
       this.app.workspace.on("loom:export", (path: string) =>
-        this.wftsar((file) => {
+        this.wftsar(async (file) => {
           const fullPath = untildify(path);
-          const json = JSON.stringify(this.state[file.path], null, 2);
-          fs.writeFileSync(fullPath, json);
 
-          new Notice("Exported to " + fullPath);
+          try {
+            // Determine export format based on file extension
+            if (fullPath.endsWith('.html')) {
+              await this.exportToHTML(file, fullPath);
+            } else {
+              // Default to JSON export
+              const json = JSON.stringify(this.state[file.path], null, 2);
+              fs.writeFileSync(fullPath, json);
+            }
+
+            new Notice("Exported to " + fullPath);
+          } catch (error) {
+            console.error('Export failed:', error);
+            new Notice(`Export failed: ${(error as Error).message}`);
+          }
+        })
+      )
+    );
+
+    this.registerEvent(
+      // @ts-expect-error
+      this.app.workspace.on("loom:export-html", (path: string) =>
+        this.wftsar(async (file) => {
+          const fullPath = untildify(path);
+          try {
+            await this.exportToHTML(file, fullPath);
+            new Notice("HTML exported to " + fullPath);
+          } catch (error) {
+            console.error('HTML export failed:', error);
+            new Notice(`Export failed: ${(error as Error).message}`);
+          }
         })
       )
     );
@@ -1162,8 +1375,26 @@ export default class LoomPlugin extends Plugin {
     const onFileOpen = (file: TFile) => {
       if (file.extension !== "md") return;
 
-      // if this file is new, initialize its state
-      if (!this.state[file.path]) this.initializeNoteState(file);
+      // Load state from storage if not already in memory
+      if (!this.state[file.path]) {
+        // For document storage, try loading from .loom.json first
+        if (this.settings.useDocumentStorage) {
+          this.storage.loadNoteState(file).then((loadedState) => {
+            if (loadedState) {
+              this.state[file.path] = loadedState;
+              // Re-trigger file open to update editor decorations
+              onFileOpen(file);
+            } else {
+              // No saved state, initialize new
+              this.initializeNoteState(file);
+            }
+          });
+          return; // Wait for async load
+        } else {
+          // Legacy storage - initialize if missing
+          this.initializeNoteState(file);
+        }
+      }
 
       const state = this.state[file.path];
 
@@ -1217,16 +1448,34 @@ export default class LoomPlugin extends Plugin {
 
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
+        // Update in-memory state
         this.state[file.path] = this.state[oldPath];
         delete this.state[oldPath];
-        this.save();
+
+        // Handle storage-specific rename
+        this.storage.handleRename(oldPath, file.path);
+
+        // Only save if using legacy storage (document storage handles its own saves)
+        if (!this.settings.useDocumentStorage) {
+          this.save();
+        }
       })
     );
 
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
+        // Delete from storage
+        if (file instanceof TFile) {
+          this.storage.deleteNoteState(file);
+        }
+
+        // Update in-memory state
         delete this.state[file.path];
-        this.save();
+
+        // Only save if using legacy storage
+        if (!this.settings.useDocumentStorage) {
+          this.save();
+        }
       })
     );
 
@@ -1236,10 +1485,35 @@ export default class LoomPlugin extends Plugin {
           leaf.view instanceof MarkdownView &&
           // @ts-ignore
           leaf.view.file.path === file.path
-        )
+        ) {
           this.editor = leaf.view.editor;
-        onFileOpen(file);
+          onFileOpen(file);
+        }
       })
+    );
+
+    this.registerEvent(
+      // @ts-expect-error
+      this.app.workspace.on("loom:set-filter", (filter: string) =>
+        this.withFile((file) => {
+          this.state[file.path].filter = filter;
+          // Only refresh the tree views, not the entire UI (to preserve focus)
+          this.app.workspace.getLeavesOfType("loom").forEach((leaf) => {
+            if (leaf.view instanceof LoomView) {
+              const view = leaf.view as LoomView;
+              if (view.tree) {
+                view.renderTree(view.tree, this.state[file.path]);
+              }
+            }
+          });
+          // Save state without re-rendering
+          if (this.settings.useDocumentStorage) {
+            this.storage.saveNoteState(file, this.state[file.path]);
+          } else {
+            this.save();
+          }
+        })
+      )
     );
   }
 
@@ -1280,11 +1554,6 @@ export default class LoomPlugin extends Plugin {
     // and "\[" with "["
     prompt = prompt.replace(/\\</g, "<").replace(/\\\[/g, "[");
 
-    // the tokenization and completion depend on the provider,
-    // so call a different method depending on the provider
-
-    // console.log("prompt", prompt);
-
     const completionMethods: Record<
       Provider,
       (prompt: string) => Promise<CompletionResult>
@@ -1298,6 +1567,7 @@ export default class LoomPlugin extends Plugin {
       "azure-chat": this.completeAzureChat,
       anthropic: this.completeAnthropic,
       openrouter: this.completeOpenRouter,
+      bedrock: this.completeBedrock,
     };
     let result;
     try {
@@ -1321,8 +1591,6 @@ export default class LoomPlugin extends Plugin {
       return;
     }
     const rawCompletions = result.completions;
-
-    // console.log("rawCompletions", rawCompletions);
 
     // escape and clean up the completions
     const completions = rawCompletions.map((completion: string) => {
@@ -1371,6 +1639,492 @@ export default class LoomPlugin extends Plugin {
     const state = this.state[file.path];
     const [id, node] = this.newNode(text, parentId, true);
     state.nodes[id] = node;
+  }
+
+  async exportToHTML(file: TFile, outputPath: string) {
+    const state = this.state[file.path];
+
+    // Apply current filter if any
+    let filteredNodes: Set<string> | null = null;
+    if (state.filter) {
+      const { include, exclude } = this.parseFilter(state.filter);
+      if (include.length > 0 || exclude.length > 0) {
+        filteredNodes = this.buildFilteredNodeSet(state, include, exclude);
+      }
+    }
+
+    const html = this.generateHTML(state, file, filteredNodes);
+
+    // Resolve the output path properly
+    let resolvedPath = outputPath;
+
+    // Check if path is absolute (Unix/Mac starts with /, Windows with C:\ etc)
+    const isAbsolute = outputPath.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(outputPath);
+
+    if (!isAbsolute) {
+      // Relative path - place it next to the source markdown file
+      const sourceDir = file.parent ? file.parent.path : '';
+      resolvedPath = sourceDir ? `${sourceDir}/${outputPath}` : outputPath;
+    }
+
+    // Use untildify to expand ~ in paths
+    const finalPath = untildify(resolvedPath);
+
+    console.log(`Resolved export path: "${outputPath}" -> "${finalPath}"`);
+
+    try {
+      if (!isAbsolute) {
+        // For relative paths, save in the vault using Obsidian's adapter
+        let vaultRelativePath: string;
+
+        // Save next to the source file or in vault root
+        vaultRelativePath = file.parent ? `${file.parent.path}/${outputPath}` : outputPath;
+
+        await this.app.vault.adapter.write(vaultRelativePath, html);
+        console.log(`Successfully exported using vault adapter: ${vaultRelativePath}`);
+      } else {
+        // For absolute paths, use direct filesystem access
+        fs.writeFileSync(finalPath, html);
+        console.log(`Successfully exported using fs: ${finalPath}`);
+      }
+    } catch (error) {
+      console.error('Export error:', error);
+      // Try fallback: save in vault root with just the filename
+      try {
+        await this.app.vault.adapter.write(outputPath, html);
+        console.log(`Successfully exported to vault root: ${outputPath}`);
+      } catch (fallbackError) {
+        console.error('Vault fallback also failed:', fallbackError);
+        throw new Error(`Cannot write export file. Try entering a full path like "~/Desktop/${outputPath}" or just "${outputPath}" to save in your vault.`);
+      }
+    }
+  }
+
+  detectNodeType(node: Node): string {
+    // If explicitly set, use that
+    if (node.nodeType) return node.nodeType;
+
+    // Heuristic detection based on node characteristics
+    if (node.generationModel || node.generationParameters) {
+      return 'ai-generated';
+    }
+
+    // Default heuristic: nodes with parents are likely AI-generated responses
+    // Root nodes are typically user-created prompts
+    if (node.parentId) {
+      return 'ai-generated';
+    }
+
+    // Root nodes are typically user-created
+    return 'user-created';
+  }
+
+  parseFilter(filterStr: string): { include: string[], exclude: string[] } {
+    const include: string[] = [];
+    const exclude: string[] = [];
+
+    if (!filterStr.trim()) return { include, exclude };
+
+    const parts = filterStr.trim().split(/\s+/);
+    for (const part of parts) {
+      if (part.startsWith('+')) {
+        include.push(part.slice(1));
+      } else if (part.startsWith('-')) {
+        exclude.push(part.slice(1));
+      } else if (part.trim()) {
+        include.push(part);
+      }
+    }
+
+    return { include, exclude };
+  }
+
+  buildFilteredNodeSet(state: NoteState, include: string[], exclude: string[]): Set<string> {
+    if (include.length === 0 && exclude.length === 0) {
+      return new Set(Object.keys(state.nodes));
+    }
+
+    const directMatches = new Set<string>();
+    const toHide = new Set<string>();
+
+    // Find nodes that directly match the filter
+    for (const [id, node] of Object.entries(state.nodes)) {
+      if (this.nodeMatchesFilter(node, include, exclude)) {
+        directMatches.add(id);
+      }
+    }
+
+    // Hide excluded nodes and descendants
+    for (const [id, node] of Object.entries(state.nodes)) {
+      const nodeTags = node.tags || [];
+      if (exclude.some(tag => nodeTags.includes(tag))) {
+        const hideDescendants = (nodeId: string) => {
+          toHide.add(nodeId);
+          for (const [childId, childNode] of Object.entries(state.nodes)) {
+            if (childNode.parentId === nodeId) {
+              hideDescendants(childId);
+            }
+          }
+        };
+        hideDescendants(id);
+      }
+    }
+
+    // Include ancestors of direct matches for tree connectivity
+    const toShow = new Set<string>();
+    for (const matchId of directMatches) {
+      if (!toHide.has(matchId)) {
+        let currentId: string | null = matchId;
+        while (currentId) {
+          if (!toHide.has(currentId)) {
+            toShow.add(currentId);
+          }
+          currentId = state.nodes[currentId]?.parentId || null;
+        }
+      }
+    }
+
+    return toShow;
+  }
+
+  nodeMatchesFilter(node: Node, include: string[], exclude: string[]): boolean {
+    const nodeTags = node.tags || [];
+
+    // Must have all included tags
+    for (const tag of include) {
+      if (!nodeTags.includes(tag)) return false;
+    }
+
+    // Must not have any excluded tags
+    for (const tag of exclude) {
+      if (nodeTags.includes(tag)) return false;
+    }
+
+    return true;
+  }
+
+  generateHTML(state: NoteState, file: TFile, filteredNodes: Set<string> | null): string {
+    const rootNodes = Object.entries(state.nodes)
+      .filter(([id, node]) => node.parentId === null && (!filteredNodes || filteredNodes.has(id)))
+      .map(([id]) => id);
+
+    const escapeHtml = (text: string) => {
+      return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    };
+
+    const formatTimestamp = (timestamp?: number) => {
+      if (!timestamp) return '';
+      return new Date(timestamp).toLocaleString();
+    };
+
+    const renderNodeHTML = (nodeId: string, depth: number = 0): string => {
+      const node = state.nodes[nodeId];
+      if (!node || (filteredNodes && !filteredNodes.has(nodeId))) return '';
+
+      const children = Object.entries(state.nodes)
+        .filter(([id, childNode]) => childNode.parentId === nodeId && (!filteredNodes || filteredNodes.has(id)))
+        .map(([id]) => id);
+
+      // Detect node type for visual indicators
+      const nodeType = node.nodeType || this.detectNodeType(node);
+      const nodeTypeClass = `node-type-${nodeType}`;
+      const nodeTypeIcon = nodeType === 'ai-generated' ? '&#x1F916;' : nodeType === 'user-edited' ? '&#x270F;&#xFE0F;' : '&#x1F464;';
+
+      const tagsHtml = (node.tags || []).length > 0
+        ? `<div class="node-tags">${(node.tags || []).map(tag =>
+            `<span class="tag tag-${tag}">${tag}</span>`
+          ).join('')}</div>`
+        : '';
+
+      const metadataHtml = `<div class="node-metadata">
+          <span class="node-type-indicator" title="${nodeType}">${nodeTypeIcon}</span>
+          ${node.created ? `<span class="created">Created: ${formatTimestamp(node.created)}</span>` : ''}
+          ${node.lastVisited ? `<span class="last-visited">Last visited: ${formatTimestamp(node.lastVisited)}</span>` : ''}
+          ${node.generationModel ? `<span class="model">Model: ${node.generationModel}</span>` : ''}
+        </div>`;
+
+      const childrenHtml = children.length > 0
+        ? `<div class="node-children">${children.map(childId => renderNodeHTML(childId, depth + 1)).join('')}</div>`
+        : '';
+
+      return `
+        <div class="node ${nodeTypeClass}" data-node-id="${nodeId}" data-depth="${depth}">
+         <div class="node-header">
+           ${children.length > 0 ? '<button class="collapse-button" onclick="toggleCollapse(this)">&#x25BC;</button>' : ''}
+           <div class="node-content">
+             <div class="node-text">${escapeHtml(node.text || 'No text')}</div>
+             ${tagsHtml}
+             ${metadataHtml}
+           </div>
+         </div>
+         ${childrenHtml}
+       </div>
+     `;
+    };
+
+    const treeHtml = rootNodes.map(rootId => renderNodeHTML(rootId)).join('');
+
+    const currentNodeText = state.current ? this.fullText(file, state.current) : '';
+
+    // Generate full text for all nodes for JavaScript access
+    const nodeFullTexts: Record<string, string> = {};
+    for (const nodeId of Object.keys(state.nodes)) {
+      nodeFullTexts[nodeId] = this.fullText(file, nodeId);
+    }
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loom Export: ${escapeHtml(file.basename)}</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            display: flex;
+            height: 100vh;
+        }
+
+        .sidebar {
+            width: 350px;
+            background: #252526;
+            border-right: 1px solid #3e3e42;
+            overflow-y: auto;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+
+        .main-content {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            background: #1e1e1e;
+        }
+
+        .header {
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #3e3e42;
+        }
+
+        .header h1 {
+            margin: 0;
+            color: #569cd6;
+            font-size: 1.5em;
+        }
+
+        .node {
+            margin: 8px 0;
+            border-left: 2px solid transparent;
+            transition: all 0.2s ease;
+        }
+
+        .node:hover {
+            border-left-color: #569cd6;
+        }
+
+        .node.active {
+            border-left-color: #569cd6;
+            background: rgba(86, 156, 214, 0.1);
+        }
+
+        .node-header {
+            display: flex;
+            align-items: flex-start;
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 4px;
+        }
+
+        .node-header:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .collapse-button {
+            background: none;
+            border: none;
+            color: #d4d4d4;
+            cursor: pointer;
+            margin-right: 8px;
+            padding: 0;
+            width: 16px;
+            text-align: center;
+            transition: transform 0.2s ease;
+        }
+
+        .collapse-button.collapsed {
+            transform: rotate(-90deg);
+        }
+
+        .node-content {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .node-text {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            margin-bottom: 4px;
+            line-height: 1.4;
+        }
+
+        .node-tags {
+            margin: 4px 0;
+        }
+
+        .tag {
+            display: inline-block;
+            background: #3e3e42;
+            color: #d4d4d4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.8em;
+            margin-right: 4px;
+        }
+
+        .tag-fav { background: #f9e71e; color: #000; }
+        .tag-to_continue { background: #569cd6; }
+        .tag-private { background: #f44747; }
+
+        .node-metadata {
+            font-size: 0.7em;
+            color: #969696;
+            margin-top: 4px;
+        }
+
+        .node-metadata span {
+            margin-right: 8px;
+        }
+
+        .node-type-indicator {
+            font-size: 1em;
+            margin-right: 8px;
+        }
+
+        .node-type-ai-generated { border-left-color: #569cd6; }
+        .node-type-user-edited { border-left-color: #ff9800; }
+        .node-type-user-created { border-left-color: #4caf50; }
+
+        .node-children {
+            margin-left: 20px;
+            border-left: 1px solid #3e3e42;
+            padding-left: 8px;
+        }
+
+        .node-children.collapsed {
+            display: none;
+        }
+
+        .current-text {
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 20px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            line-height: 1.6;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+        }
+
+        .export-info {
+            margin-bottom: 20px;
+            padding: 10px;
+            background: rgba(86, 156, 214, 0.1);
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+
+        @media (max-width: 768px) {
+            body { flex-direction: column; }
+            .sidebar { width: 100%; height: 40vh; }
+            .main-content { height: 60vh; }
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="header">
+            <h1>${escapeHtml(file.basename)}</h1>
+        </div>
+        <div class="tree">
+            ${treeHtml}
+        </div>
+    </div>
+
+    <div class="main-content">
+        <div class="export-info">
+            <strong>Loom Export</strong><br>
+            Generated: ${new Date().toLocaleString()}<br>
+            ${filteredNodes ? `Filtered nodes: ${filteredNodes.size} of ${Object.keys(state.nodes).length}` : `Total nodes: ${Object.keys(state.nodes).length}`}
+        </div>
+
+        <div class="current-text" id="current-text">
+            ${escapeHtml(currentNodeText)}
+        </div>
+    </div>
+
+    <script>
+        // Full text data for each node
+        const nodeFullTexts = ${JSON.stringify(nodeFullTexts)};
+
+        function toggleCollapse(button) {
+            button.classList.toggle('collapsed');
+            const nodeChildren = button.closest('.node').querySelector('.node-children');
+            if (nodeChildren) {
+                nodeChildren.classList.toggle('collapsed');
+            }
+        }
+
+        function selectNode(nodeId) {
+            // Remove active class from all nodes
+            document.querySelectorAll('.node').forEach(n => n.classList.remove('active'));
+
+            // Add active class to selected node
+            const selectedNode = document.querySelector(\`[data-node-id="\${nodeId}"]\`);
+            if (selectedNode) {
+                selectedNode.classList.add('active');
+
+                // Update main content with node's full path text
+                const fullText = nodeFullTexts[nodeId] || 'No text available';
+                document.getElementById('current-text').textContent = fullText;
+
+                // Scroll the main content to top
+                document.querySelector('.main-content').scrollTop = 0;
+            }
+        }
+
+        // Add click handlers to nodes
+        document.querySelectorAll('.node-header').forEach(header => {
+            header.addEventListener('click', (e) => {
+                if (e.target.classList.contains('collapse-button')) return;
+
+                const nodeId = header.closest('.node').dataset.nodeId;
+                selectNode(nodeId);
+            });
+        });
+
+        // Select the current node on load
+        if ('${state.current}') {
+            selectNode('${state.current}');
+        } else {
+            // If no current node, select the first root node
+            const firstRoot = document.querySelector('.node');
+            if (firstRoot) {
+                selectNode(firstRoot.dataset.nodeId);
+            }
+        }
+    </script>
+</body>
+</html>`;
   }
 
   async completeCohere(prompt: string) {
@@ -1477,7 +2231,6 @@ export default class LoomPlugin extends Plugin {
       "gpt-3.5-turbo",
       "gpt-3.5-turbo-0301",
       "gpt-4-base",
-      // TODO: llama 3.1 has "28k additional multilingual tokens", so cl100k is not exactly right
       "meta-llama/llama-3.1-8b",
       "meta-llama/llama-3.1-70b",
       "meta-llama/llama-3.1-405b",
@@ -1497,14 +2250,13 @@ export default class LoomPlugin extends Plugin {
       "davinci-codex",
       "cushman-codex",
     ];
-    // const r50kModels = ["text-davinci-001", "text-curie-001", "text-babbage-001", "text-ada-001", "davinci", "curie", "babbage", "ada"];
 
     let tokenizer;
     if (cl100kModels.includes(getPreset(this.settings).model))
       tokenizer = cl100k;
     else if (p50kModels.includes(getPreset(this.settings).model))
       tokenizer = p50k;
-    else tokenizer = r50k; // i expect that an unknown model will most likely be r50k
+    else tokenizer = r50k;
 
     return tokenizer.decode(
       tokenizer
@@ -1526,7 +2278,7 @@ export default class LoomPlugin extends Plugin {
     if (!url.endsWith("/")) url += "/";
     url = url.replace(/v1\//, "");
     url += "v1/completions";
-    
+
     let body: any = {
       prompt,
       model: getPreset(this.settings).model,
@@ -1573,10 +2325,10 @@ export default class LoomPlugin extends Plugin {
               (choice: any) => choice.text
             ),
           }
-        : { 
-            ok: false, 
-            status: response.status, 
-            message: response.json?.error?.message || "Unknown error" 
+        : {
+            ok: false,
+            status: response.status,
+            message: response.json?.error?.message || "Unknown error"
           };
 
     if (!result.ok && this.settings.logApiCalls) {
@@ -1822,7 +2574,6 @@ export default class LoomPlugin extends Plugin {
 
   async getAnthropicResponse(prompt: string) {
     prompt = this.trimOpenAIPrompt(prompt);
-    // let result: CompletionResult;
     const body = JSON.stringify(
       {
         model: getPreset(this.settings).model,
@@ -1837,6 +2588,7 @@ export default class LoomPlugin extends Plugin {
       null,
       2
     );
+
     if (this.settings.logApiCalls) {
       console.log(`request body: ${body}`);
     }
@@ -1859,9 +2611,6 @@ export default class LoomPlugin extends Plugin {
 
       const result = response.json.content[0]?.text || "<no text>";
 
-      // ? { ok: true, completions: [response.json.content[0]?.text || "<no text>"] }
-      // : { ok: false, status: response.status, message: "" };
-
       if (this.settings.logApiCalls) {
         console.log(result);
       }
@@ -1873,21 +2622,315 @@ export default class LoomPlugin extends Plugin {
     }
   }
 
+  async completeBedrock(prompt: string) {
+    const completions = await Promise.all(
+      [...Array(this.settings.n).keys()].map(async () => {
+        return await this.getBedrockResponse(prompt);
+      })
+    );
+
+    const result: CompletionResult = { ok: true, completions };
+    return result;
+  }
+
+  async getBedrockResponse(prompt: string) {
+    prompt = this.trimOpenAIPrompt(prompt);
+    const preset = getPreset(this.settings);
+    // @ts-expect-error - Bedrock preset has region property
+    const region = preset.region || 'us-east-1';
+
+    if (!preset.apiKey.includes(':')) {
+      throw new Error('Bedrock API key must be in format: accessKeyId:secretAccessKey');
+    }
+
+    const body = JSON.stringify({
+      anthropic_version: "bedrock-2023-05-31",
+      max_tokens: this.settings.maxTokens,
+      temperature: this.settings.temperature,
+      system: this.settings.systemPrompt,
+      messages: [
+        { role: "user", content: `${this.settings.userMessage}` },
+        { role: "assistant", content: `${prompt}` },
+      ],
+    });
+
+    if (this.settings.logApiCalls) {
+      console.log(`Bedrock request body: ${body}`);
+    }
+
+    // Try direct HTTP implementation first, with Node.js fallback
+    try {
+      return await this.getBedrockResponseDirect(prompt);
+    } catch (obsidianError) {
+      return await this.getBedrockResponseNodeJS(prompt);
+    }
+  }
+
+  async getBedrockResponseDirect(prompt: string) {
+    prompt = this.trimOpenAIPrompt(prompt);
+    const preset = getPreset(this.settings);
+
+    if (!preset.apiKey.includes(':')) {
+      throw new Error('Bedrock API key must be in format: accessKeyId:secretAccessKey');
+    }
+
+    const [accessKeyId, secretAccessKey] = preset.apiKey.split(':');
+    // @ts-expect-error - Bedrock preset has region property
+    const region = preset.region || 'us-east-1';
+
+    const body = JSON.stringify({
+      anthropic_version: "bedrock-2023-05-31",
+      max_tokens: this.settings.maxTokens,
+      temperature: this.settings.temperature,
+      system: this.settings.systemPrompt,
+      messages: [
+        { role: "user", content: `${this.settings.userMessage}` },
+        { role: "assistant", content: `${prompt}` },
+      ],
+    });
+
+    const host = `bedrock-runtime.${region}.amazonaws.com`;
+    const url = `https://${host}/model/${preset.model}/invoke`;
+
+    // Create AWS signature v4
+    const awsSignature = this.createAwsSignature({
+      method: 'POST',
+      url,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body,
+      accessKeyId,
+      secretAccessKey,
+      region,
+      service: 'bedrock'
+    });
+
+    try {
+      const response = await requestUrl({
+        url,
+        method: 'POST',
+        headers: awsSignature.headers,
+        body,
+      });
+
+      if (response.status !== 200) {
+        let errorMessage = 'Unknown error';
+        if (response.json && response.json.message) {
+          errorMessage = response.json.message;
+        } else if (response.text) {
+          errorMessage = response.text;
+        }
+        throw new Error(`Bedrock API error: ${response.status} - ${errorMessage}`);
+      }
+
+      return response.json?.content?.[0]?.text || "<no text>";
+
+    } catch (e) {
+      throw e;
+    }
+  }
+
+  async getBedrockResponseNodeJS(prompt: string) {
+    prompt = this.trimOpenAIPrompt(prompt);
+    const preset = getPreset(this.settings);
+    // @ts-expect-error - Bedrock preset has region property
+    const region = preset.region || 'us-east-1';
+
+    if (!preset.apiKey.includes(':')) {
+      throw new Error('Bedrock API key must be in format: accessKeyId:secretAccessKey');
+    }
+
+    const [accessKeyId, secretAccessKey] = preset.apiKey.split(':');
+
+    const body = JSON.stringify({
+      anthropic_version: "bedrock-2023-05-31",
+      max_tokens: this.settings.maxTokens,
+      temperature: this.settings.temperature,
+      system: this.settings.systemPrompt,
+      messages: [
+        { role: "user", content: `${this.settings.userMessage}` },
+        { role: "assistant", content: `${prompt}` },
+      ],
+    });
+
+    const host = `bedrock-runtime.${region}.amazonaws.com`;
+    const url = `https://${host}/model/${preset.model}/invoke`;
+
+    // Create AWS signature v4
+    const awsSignature = this.createAwsSignature({
+      method: 'POST',
+      url,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body,
+      accessKeyId,
+      secretAccessKey,
+      region,
+      service: 'bedrock'
+    });
+
+    return new Promise<string>((resolve, reject) => {
+      const https = require('https');
+      const urlObj = new URL(url);
+
+      const options = {
+        hostname: urlObj.hostname,
+        port: 443,
+        path: urlObj.pathname,
+        method: 'POST',
+        headers: awsSignature.headers,
+      };
+
+      const req = https.request(options, (res: any) => {
+        let responseBody = '';
+
+        res.on('data', (chunk: any) => {
+          responseBody += chunk;
+        });
+
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            try {
+              const parsed = JSON.parse(responseBody);
+              const result = parsed.content[0]?.text || "<no text>";
+              resolve(result);
+            } catch (parseError) {
+              reject(new Error(`Failed to parse response: ${parseError}`));
+            }
+          } else {
+            reject(new Error(`Bedrock error ${res.statusCode}: ${responseBody}`));
+          }
+        });
+      });
+
+      req.on('error', (error: any) => {
+        reject(error);
+      });
+
+      req.write(body);
+      req.end();
+    });
+  }
+
+  createAwsSignature(params: {
+    method: string;
+    url: string;
+    headers: Record<string, string>;
+    body: string;
+    accessKeyId: string;
+    secretAccessKey: string;
+    region: string;
+    service: string;
+  }) {
+    const crypto = require('crypto');
+
+    const { method, url, headers, body, accessKeyId, secretAccessKey, region, service } = params;
+    const urlParts = new URL(url);
+    const host = urlParts.hostname;
+    // URL encode the path properly for AWS signature
+    const path = encodeURI(urlParts.pathname).replace(/:/g, '%3A');
+    const queryString = urlParts.search.substring(1);
+
+    const now = new Date();
+    const amzDate = now.toISOString().replace(/[:\-]|\.\d{3}/g, '');
+    const dateStamp = amzDate.substring(0, 8);
+
+    const payloadHash = crypto.createHash('sha256').update(body).digest('hex');
+
+    // Build canonical headers (must be sorted)
+    const requiredHeaders: Record<string, string> = {
+      'content-type': 'application/json',
+      'host': host,
+      'x-amz-date': amzDate
+    };
+
+    const canonicalHeaderNames = Object.keys(requiredHeaders).sort();
+    const canonicalHeaders = canonicalHeaderNames
+      .map(name => `${name}:${requiredHeaders[name]}`)
+      .join('\n') + '\n';
+
+    const signedHeaders = canonicalHeaderNames.join(';');
+
+    // Build canonical request
+    const canonicalRequest = [
+      method.toUpperCase(),
+      path,
+      queryString,
+      canonicalHeaders,
+      signedHeaders,
+      payloadHash
+    ].join('\n');
+
+    // Build string to sign
+    const algorithm = 'AWS4-HMAC-SHA256';
+    const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+    const stringToSign = [
+      algorithm,
+      amzDate,
+      credentialScope,
+      crypto.createHash('sha256').update(canonicalRequest).digest('hex')
+    ].join('\n');
+
+    // Generate signing key
+    const getSignatureKey = (key: string, dateStamp: string, regionName: string, serviceName: string) => {
+      const kDate = crypto.createHmac('sha256', 'AWS4' + key).update(dateStamp).digest();
+      const kRegion = crypto.createHmac('sha256', kDate).update(regionName).digest();
+      const kService = crypto.createHmac('sha256', kRegion).update(serviceName).digest();
+      const kSigning = crypto.createHmac('sha256', kService).update('aws4_request').digest();
+      return kSigning;
+    };
+
+    const signingKey = getSignatureKey(secretAccessKey, dateStamp, region, service);
+    const signature = crypto.createHmac('sha256', signingKey).update(stringToSign).digest('hex');
+
+    const authorizationHeader = `${algorithm} Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+    return {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Amz-Date': amzDate,
+        'Authorization': authorizationHeader
+      }
+    };
+  }
+
   async loadSettings() {
     const settings = (await this.loadData())?.settings || {};
     this.settings = Object.assign({}, DEFAULT_SETTINGS, settings);
   }
 
   async loadState() {
-    this.state = (await this.loadData())?.state || {};
+    // Initialize storage based on settings
+    if (this.settings.useDocumentStorage) {
+      this.storage = new DocumentStorage(this.app, this.settings);
+    } else {
+      // Load legacy state first
+      const legacyState = (await this.loadData())?.state || {};
+      this.state = legacyState;
+      this.storage = new LegacyStorage(this.app, this, this.state);
+    }
+
+    // Load all states through storage interface
+    this.state = await this.storage.loadAllStates();
   }
 
   async save() {
+    // Save settings separately (always using the plugin's data.json)
     await this.saveData({ settings: this.settings, state: this.state });
+
+    // If using document storage, we only save settings to data.json
+    if (this.settings.useDocumentStorage) {
+      await this.saveData({ settings: this.settings, state: {} });
+    }
+
     this.initializeProviders();
   }
 
-  // Add this new method to properly refresh all views
+  // Properly refresh all views
   private refreshViews() {
     // Refresh Loom views
     this.app.workspace.getLeavesOfType("loom").forEach((leaf) => {
@@ -1896,7 +2939,7 @@ export default class LoomPlugin extends Plugin {
       }
     });
 
-    // Refresh Loom siblings views  
+    // Refresh Loom siblings views
     this.app.workspace.getLeavesOfType("loom-siblings").forEach((leaf) => {
       if (leaf.view instanceof LoomSiblingsView) {
         leaf.view.render();
@@ -1904,9 +2947,17 @@ export default class LoomPlugin extends Plugin {
     });
   }
 
-  // Update saveAndRender to use the new refresh method
   async saveAndRender() {
-    await this.save();
+    // When using document storage, we need to save the current file's state
+    if (this.settings.useDocumentStorage) {
+      const activeFile = this.app.workspace.getActiveFile();
+      if (activeFile && this.state[activeFile.path]) {
+        await this.storage.saveNoteState(activeFile, this.state[activeFile.path]);
+      }
+    } else {
+      // Legacy behavior - save everything
+      await this.save();
+    }
 
     if (this.rendering) return;
     this.rendering = true;
@@ -1914,6 +2965,48 @@ export default class LoomPlugin extends Plugin {
     this.refreshViews();
 
     this.rendering = false;
+  }
+
+  async onunload() {
+    // Clean up document storage if it exists
+    if (this.storage && this.storage.getType() === 'document') {
+      (this.storage as DocumentStorage).destroy();
+    }
+  }
+
+  /**
+   * Convert legacy monolithic state to per-document `.loom.json` files.
+   */
+  async migrateToDocumentStorage() {
+    const docStorage = new DocumentStorage(this.app, this.settings);
+    const legacyStates = { ...this.state };
+    const errors: string[] = [];
+
+    for (const [path, noteState] of Object.entries(legacyStates)) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (file instanceof TFile) {
+        try {
+          await docStorage.saveNoteState(file, noteState);
+        } catch (err) {
+          console.error('Migration error for', path, err);
+          errors.push(path);
+        }
+      } else {
+        console.warn('Markdown file missing for saved loom:', path);
+        errors.push(path + ' (missing)');
+      }
+    }
+
+    if (errors.length) {
+      new Notice(`Migration finished with ${errors.length} errors. Check console for details.`, 8000);
+      return;
+    }
+
+    // Success - switch to document storage
+    this.state = {};
+    this.settings.useDocumentStorage = true;
+    await this.save();
+    new Notice('Migration complete! Document storage enabled. Please restart Obsidian.', 8000);
   }
 }
 
@@ -2221,10 +3314,15 @@ class LoomSettingTab extends PluginSettingTab {
             ...preset,
             // @ts-expect-error
             apiKey: this.plugin.settings.anthropicApiKey || "",
-            // // @ts-expect-error
-            // systemPrompt: this.plugin.settings.anthropicSystemPrompt || "",
-            // // @ts-expect-error
-            // userMessage: this.plugin.settings.anthropicUserMessage || "",
+          };
+          break;
+        }
+        case "bedrock": {
+          preset = {
+            ...preset,
+            // @ts-expect-error
+            apiKey: "",
+            region: "us-east-1",
           };
           break;
         }
@@ -2279,6 +3377,7 @@ class LoomSettingTab extends PluginSettingTab {
           "azure-chat": "Azure (Chat)",
           cohere: "Cohere",
           textsynth: "TextSynth",
+          bedrock: "Amazon Bedrock",
         };
         dropdown.addOptions(options);
         dropdown.setValue(
@@ -2385,6 +3484,26 @@ class LoomSettingTab extends PluginSettingTab {
         );
       }
 
+      if (this.plugin.settings.modelPresets[this.plugin.settings.modelPreset].provider === "bedrock") {
+        new Setting(presetFields).setName("Region").addText((text) =>
+          text
+            .setValue(
+              this.plugin.settings.modelPresets[
+                this.plugin.settings.modelPreset
+              // @ts-expect-error TODO
+              ].region || "us-east-1"
+            )
+            .setPlaceholder("us-east-1")
+            .onChange(async (value) => {
+              this.plugin.settings.modelPresets[
+                this.plugin.settings.modelPreset
+              // @ts-expect-error TODO
+              ].region = value;
+              await this.plugin.save();
+            })
+        );
+      }
+
       if (this.plugin.settings.modelPresets[this.plugin.settings.modelPreset].provider === "openrouter") {
         new Setting(presetFields).setName("Quantization").addDropdown((dropdown) =>
           dropdown
@@ -2450,8 +3569,6 @@ class LoomSettingTab extends PluginSettingTab {
     updatePresetFields();
     updatePresetList();
 
-    // TODO simplify below?
-
     const passagesHeader = containerEl.createDiv({
       cls: "setting-item setting-item-heading",
     });
@@ -2513,5 +3630,75 @@ class LoomSettingTab extends PluginSettingTab {
             await this.plugin.save();
           })
       );
+
+    new Setting(containerEl)
+      .setName("Developer mode")
+      .setDesc("Enable debug logging for filters and storage")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.developerMode)
+          .onChange(async (value) => {
+            this.plugin.settings.developerMode = value;
+            await this.plugin.save();
+          })
+      );
+
+    // Storage Settings
+    const storageHeader = containerEl.createDiv({
+      cls: "setting-item setting-item-heading",
+    });
+    storageHeader.createDiv({ cls: "setting-item-name", text: "Storage (Experimental)" });
+
+    // Toggle for enabling document storage
+    new Setting(containerEl)
+      .setName("Use document-based storage")
+      .setDesc("Store each loom in a separate file instead of one large data.json (BETA - backup your data first!)")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.useDocumentStorage)
+          .onChange(async (value) => {
+            this.plugin.settings.useDocumentStorage = value;
+            await this.plugin.save();
+            this.display();
+            new Notice(
+              "Please restart Obsidian for storage changes to take effect",
+              5000
+            );
+          })
+      );
+
+    // Storage location dropdown
+    new Setting(containerEl)
+      .setName("Storage location")
+      .setDesc("Where to store .loom.json files")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({
+            alongside: "Alongside markdown files",
+            "plugin-folder": "In plugin folder",
+          })
+          .setValue(this.plugin.settings.documentStorageLocation)
+          .onChange(async (value: 'alongside' | 'plugin-folder') => {
+            this.plugin.settings.documentStorageLocation = value;
+            await this.plugin.save();
+          })
+      )
+      .setDisabled(!this.plugin.settings.useDocumentStorage);
+
+    // Migration command
+    containerEl.createEl("p", {
+      text: "Convert existing looms to per-document storage:",
+      cls: "setting-item-description",
+    });
+    const migrationDiv = containerEl.createDiv({ cls: "setting-item" });
+    const migrationButton = migrationDiv.createEl("button", {
+      text: "Migrate to Document Storage",
+    });
+    migrationButton.addEventListener("click", () => {
+      new ConfirmMigrationModal(this.app, async () => {
+        await this.plugin.migrateToDocumentStorage();
+        this.display(); // refresh UI to reflect new state
+      }).open();
+    });
   }
 }
